@@ -183,11 +183,15 @@ MAIN_KB = {
 }
 
 
-def send(chat_id: int, text: str, kb: Optional[Dict] = None):
+def send(chat_id: int, text: str, kb: Optional[Dict] = None) -> Optional[int]:
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if kb is not None:
         payload["reply_markup"] = kb
-    api("sendMessage", payload)
+    r = api("sendMessage", payload)
+    try:
+        return int(r.get("result", {}).get("message_id"))
+    except Exception:
+        return None
 
 
 def answer_callback(callback_id: str, text: str = ""):
@@ -730,16 +734,23 @@ def admin_send_start(dev_id: str, chat_id: int):
     send(chat_id, f"✉️ Send via <code>{html.escape(dev_id)}</code>\n\nStep 1/2 — recipient number (e.g. <code>+15551234567</code>):", ADMIN_CANCEL_KB)
 
 
-def admin_send_confirm(chat_id: int, message_id: Optional[int] = None):
+def admin_confirm_async(chat_id: int) -> None:
+    confirm_async(chat_id, lambda mid, online: admin_send_confirm(chat_id, mid, _online=online))
+
+
+def admin_send_confirm(chat_id: int, message_id: Optional[int] = None, _online: Optional[List[Dict[str, Any]]] = None):
     d = ADM_DRAFT.get(chat_id)
     if not d:
-        send(chat_id, "Session expired.", MAIN_KB)
+        if message_id is not None:
+            edit(chat_id, message_id, "Session expired.", MAIN_KB)
+        else:
+            send(chat_id, "Session expired.", MAIN_KB)
         return
     sim = d.get("sim", 1)
     mode = d.get("mode", "single")
     count = max(1, min(MAX_SEND_COUNT, int(d.get("count", 1))))
     d["count"] = count
-    online = online_devices()
+    online = _online if _online is not None else online_devices()
     preview = d["text"][:300] + ("…" if len(d["text"]) > 300 else "")
     if mode == "all":
         via = f"🌐 All online devices ({len(online)} across {len(pool_urls())} DBs)"
@@ -1225,23 +1236,97 @@ def handle_user_stage(chat_id: int, text: str):
             send(chat_id, f"Too long ({len(t)} chars). Keep it under {USER_MAX_TEXT}:", USER_CANCEL_KB)
             return
         st.update(stage="confirm", text=t)
-        user_confirm(chat_id, None)
+        threading.Thread(target=lambda: user_confirm_async(chat_id), daemon=True).start()
     else:
         send(chat_id, "Please use the buttons below to continue.", USER_KB)
 
 
-def user_confirm(chat_id: int, message_id: Optional[int] = None):
+def safe_online() -> List[Dict[str, Any]]:
+    try:
+        return online_devices()
+    except Exception:
+        return []
+
+
+def pool_cache_fresh() -> bool:
+    """True if every pool DB has a fresh device cache → confirm can skip animation."""
+    try:
+        bases = pool_urls()
+        if not bases:
+            return False
+        now = time.time()
+        by = POOL_CACHE.get("by_base", {})
+        for b in bases:
+            e = by.get(b)
+            if not e or e[1] is None or now - e[0] >= DEV_CACHE_TTL:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def indeterminate_bar(i: int, width: int = 10) -> str:
+    block, span = 3, width
+    cyc = span * 2 - 2
+    p = i % cyc
+    pos = p if p < span else cyc - p
+    pos = max(0, min(span - block, pos))
+    return "░" * pos + "█" * block + "░" * (span - pos - block)
+
+
+def confirm_async(chat_id: int, render, base: str = "Checking available devices") -> None:
+    """Fast path (fresh cache → instant render, zero extra API calls) or animated
+    placeholder (indeterminate bar + elapsed timer, 1.1s steps, max 12 frames)
+    while fetching, then render by editing the placeholder in place."""
+    if pool_cache_fresh():
+        render(None, safe_online())
+        return
+    mid = send(chat_id, f"📡 <b>{base}…</b>\n<i>Connecting you, please wait.</i>", None)
+    if not mid:
+        render(None, safe_online())
+        return
+    box: Dict[str, Any] = {}
+    worker = threading.Thread(target=lambda: box.update(online=safe_online()), daemon=True)
+    worker.start()
+    t0 = time.time()
+    for i in range(12):
+        worker.join(1.1)
+        if not worker.is_alive():
+            break
+        try:
+            api("editMessageText", {"chat_id": chat_id, "message_id": mid,
+                                    "text": f"📡 <b>{base}</b> {indeterminate_bar(i)}\n<i>Connecting you… {int(time.time() - t0)}s</i>",
+                                    "parse_mode": "HTML", "disable_web_page_preview": True})
+        except Exception:
+            pass
+    worker.join()
+    render(mid, box.get("online", []))
+
+
+def user_confirm_async(chat_id: int) -> None:
+    """Placeholder + spinner while the device fetch runs, then render confirm
+    by editing the placeholder in place (bot never looks stuck)."""
+    confirm_async(chat_id, lambda mid, online: user_confirm(chat_id, mid, _online=online))
+
+
+def user_confirm(chat_id: int, message_id: Optional[int] = None, _online: Optional[List[Dict[str, Any]]] = None):
+    def _fail(text: str, kb: Dict[str, Any]):
+        if message_id is not None:
+            edit(chat_id, message_id, text, kb)
+        else:
+            send(chat_id, text, kb)
+
     st = USTATE.get(chat_id)
     if not st or "to" not in st or "text" not in st:
         USTATE.pop(chat_id, None)
-        send(chat_id, "Session expired. Start again with 📩 Send message.", USER_KB)
+        _fail("Session expired. Start again with 📩 Send message.", USER_KB)
         return
     if not fb_base() and not pool_urls():
-        send(chat_id, "⚠️ Sending is not configured yet. Please try later.", USER_KB)
+        _fail("⚠️ Sending is not configured yet. Please try later.", USER_KB)
         return
-    online = online_devices()
+    online = _online if _online is not None else online_devices()
     if not online:
-        send(chat_id, "⚠️ No senders are online right now. Try again later.", USER_KB)
+        _fail("⚠️ No senders are online right now. Try again later.", USER_KB)
         return
     sender = st.get("sender")
     dev = next((d for d in online if d["id"] == sender and d["db"] == st.get("sender_db")), None)
@@ -1580,7 +1665,7 @@ def main():
                                 send(chat_id, "Empty message — type the text:", ADMIN_CANCEL_KB)
                             else:
                                 ADM_DRAFT[chat_id] = {"dev": mode[1], "devdb": mode[2], "to": mode[3], "text": t[:1000], "sim": 1, "mode": "single", "count": 1}
-                                admin_send_confirm(chat_id, None)
+                                threading.Thread(target=lambda: admin_confirm_async(chat_id), daemon=True).start()
                         continue
 
                     text = msg.get("text", "").strip()
