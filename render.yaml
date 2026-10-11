@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: tb-pnl-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python tb-pnl.py
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ADMIN_CHAT_ID
+        sync: false
+      - key: SEED_URLS
+        sync: false

@@ -1,0 +1,8 @@
+.tib.env
+bot_urls.json
+bot_users.json
+bot_sends.json
+bot_pool.json
+bot.log
+__pycache__/
+*.pyc
