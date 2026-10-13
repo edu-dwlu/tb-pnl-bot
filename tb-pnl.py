@@ -576,6 +576,57 @@ def sms_threads(chat_id=None, message_id=None, online_only: bool = True) -> str:
     return ""
 
 
+_NUM_WORD = r"(?:Number|नंबर|Nambhar|नम्बर|No\.?|Num)"
+_CARRIERS = r"(?:Jio|JIO|Airtel|AIRTEL|Vi|VI|Vodafone|VODAFONE|Idea|IDEA|BSNL|bsnl|MTNL|mtnl|Docomo|DOCOMO|Tata|Reliance|RELIANCE|Telenor|TELENOR|Uninor|UNINOR|Videocon|VIDEOCON)"
+_MINING_PATTERNS = [
+    rf"(?:{_CARRIERS})\s+{_NUM_WORD}\s*[:\-]\s*([6-9][0-9]{{9}})",
+    r"(?:नंबर|नम्बर)\s*[:\-]\s*([6-9][0-9]{9})",
+    r"(?:your\s+)?(?:mobile|mob\.?|phone|contact)\s+(?:no\.?|number|num|नंबर)\s*[:\-]\s*(\+?91[-\s]?[6-9][0-9]{9})",
+    r"(?:your\s+)?(?:mobile|mob\.?|phone|contact)\s+(?:no\.?|number|num|नंबर)\s*[:\-]\s*([6-9][0-9]{9})",
+    r"Number\s*[:\-]\s*([6-9][0-9]{9})",
+    r"registered\s+(?:mobile\s+)?(?:number|no\.?)\s*[:\-]?\s*([6-9][0-9]{9})",
+    r"(\+91[-\s]?[6-9][0-9]{9})",
+    r"(?:\b91)([6-9][0-9]{9})\b",
+    r"(?:^|\s|:)([6-9][0-9]{9})(?:\s|$|\.)",
+]
+_MINING_RES = [re.compile(p) for p in _MINING_PATTERNS]
+
+
+def mine_number_from_text(text: str) -> Optional[str]:
+    """Indian-mobile miner, ported 1:1 from the website's yh() extractor:
+    first pattern that hits wins; returns normalized 10 digits or None."""
+    if not text:
+        return None
+    for rx in _MINING_RES:
+        m = rx.search(text)
+        if m and m.group(1):
+            d = re.sub(r"[^0-9]", "", m.group(1))
+            if len(d) == 10 and d[0] in "6789":
+                return d
+            if len(d) == 12 and d.startswith("91") and d[2] in "6789":
+                return d[2:]
+    return None
+
+
+def mine_device_number(dev_id: str, limit: int = 50) -> Optional[str]:
+    """Last-resort fallback, same as the website (o.phoneNumbers[0]): first
+    number mined from the device's recent message texts, newest first."""
+    try:
+        data = fb_get(f"messages/{dev_id}", f"orderBy=%22$key%22&limitToLast={limit}")
+        if not isinstance(data, dict) or "error" in data:
+            return None
+        keys = sorted(data.keys(), key=lambda k: int(k) if str(k).isdigit() else 0, reverse=True)
+        for k in keys:
+            msg = data[k]
+            if isinstance(msg, dict):
+                n = mine_number_from_text(str(msg.get("message", "")))
+                if n:
+                    return n
+    except Exception:
+        pass
+    return None
+
+
 def device_info(dev_id: str) -> Dict[str, Any]:
     """Single-device lookup for thread headers (active DB): name, number, SIMs,
     battery, online status. One cheap GET, reused parse logic."""
@@ -613,9 +664,16 @@ def thread_header(dev_id: str) -> str:
             parts.append(n)
     sims_txt = ", ".join(parts) if parts else "-"
     number = str(info.get("phoneNumber") or "-")
+    mined = False
+    if number == "-":
+        # website parity: fall back to numbers mined from SMS bodies
+        hit = mine_device_number(dev_id)
+        if hit:
+            number = hit
+            mined = True
     num_line = f"📞 <code>{html.escape(number)}</code>"
     if number == "-":
-        num_line += " <i>(device never reported its number)</i>"
+        num_line += " <i>(no number anywhere — not even in messages)</i>"
     return (
         f"<b>💬 {html.escape(str(info.get('name') or dev_id))}</b> {dot}\n"
         f"{num_line} · "
