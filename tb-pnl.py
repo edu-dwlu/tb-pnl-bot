@@ -70,7 +70,7 @@ except Exception:
 
 
 FIREBASE_URL_LIST_RE = re.compile(
-    r"https?://[A-Za-z0-9-]+\.(?:firebaseio\.com|firebasedatabase\.app)", re.I
+    r"https?://[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:firebaseio\.com|firebasedatabase\.app)", re.I
 )
 
 ACTIVE_DB = {"url": None}
@@ -884,6 +884,9 @@ def add_url(chat_id: int, value: str):
         return
     targets = parse_input(value)
     if not targets:
+        if re.search(r"[?&](?:m|s|data|db)=", value):
+            send(chat_id, "❌ Couldn't find any Firebase URL in that link. It may use a host format I don't recognize — paste a raw <code>https://....firebaseio.com</code> URL instead.", MAIN_KB)
+            return
         targets = [value]
     urls = load_urls()
     added = []
