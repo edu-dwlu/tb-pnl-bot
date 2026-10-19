@@ -6,3 +6,5 @@ bot_pool.json
 bot.log
 __pycache__/
 *.pyc
+
+bot_protection.json
