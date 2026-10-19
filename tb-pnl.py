@@ -804,6 +804,15 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     """Queue the same message on many devices with a live progress animation.
     targets = [{"db": base, "id": dev}] (one command slot per device, any DB)."""
     kb = MAIN_KB if admin else USER_KB
+    hit = prot_matches(to)
+    if hit and not admin:
+        # one clean block, no progress bar, no per-device failures, no Firebase
+        body = f"🛡 <b>Not allowed:</b> <code>{html.escape(hit)}</code> is protected by the admin."
+        if message_id is not None:
+            edit(chat_id, message_id, body, kb)
+        else:
+            send(chat_id, body, kb)
+        return
     total = len(targets)
     ok_list: List[Dict[str, str]] = []
     fail_list: List[str] = []
@@ -1976,8 +1985,11 @@ def main():
                         elif mode == "remove":
                             remove_url(chat_id, msg.get("text", ""))
                         elif mode == "prot_add":
-                            PENDING.pop(chat_id, None)
-                            protect_add_result(chat_id, protect_add(msg.get("text", "")))
+                            t = (msg.get("text") or "").strip()
+                            if t.startswith("/"):
+                                handle_command(chat_id, t)  # /cancel, /protection… escape hatch
+                                continue
+                            protect_add_result(chat_id, protect_add(t))
                             protection_screen(chat_id)
                         elif isinstance(mode, tuple) and mode[0] == "adm_num":
                             to = normalize_phone(msg.get("text", ""))
