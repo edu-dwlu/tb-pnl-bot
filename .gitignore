@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 
 bot_protection.json
+
+bot_credits.json

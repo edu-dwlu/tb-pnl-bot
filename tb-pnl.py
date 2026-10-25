@@ -37,7 +37,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -447,7 +447,10 @@ def fetch_all_devices(force: bool = False) -> List[Dict[str, Any]]:
     if not bases:
         return []
     if len(bases) == 1:
-        return fetch_devices(bases[0], force)
+        try:
+            return fetch_devices(bases[0], force)
+        except Exception:
+            return []
     out: List[Dict[str, Any]] = []
     lock = threading.Lock()
     workers = min(32, len(bases))
@@ -798,11 +801,35 @@ def online_devices() -> List[Dict[str, Any]]:
         return []
 
 
+def _user_pickup(user_id: int, marker: Dict[str, Any]) -> None:
+    """Watchdog: frees the per-user send slot after USER_SEND_TIMEOUT,
+    aborts the running send thread (stop-event) and notifies the user."""
+    waited = 0
+    while waited < USER_SEND_TIMEOUT and USER_ACTIVE.get(user_id) is marker and not marker["ev"].is_set():
+        time.sleep(5)
+        waited += 5
+    if USER_ACTIVE.get(user_id) is marker:
+        marker["ev"].set()
+        USER_ACTIVE.pop(user_id, None)
+        try:
+            send(user_id, f"⏳⌛ <b>Send timed out</b> after {USER_SEND_TIMEOUT // 60} min — "
+                          f"the senders were too slow to take all messages. You're free to send again.")
+        except Exception:
+            pass
+
+
+def _user_marker(user_id: Any) -> Optional[Dict[str, Any]]:
+    """Active-send marker of this user (None when unknown)."""
+    return USER_ACTIVE.get(user_id) if user_id is not None else None
+
+
 def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                   targets: List[Dict[str, str]], sim: int, admin: bool, user_id: Any = None,
-                  capped_note: str = "") -> None:
-    """Queue the same message on many devices with a live progress animation.
-    targets = [{"db": base, "id": dev}] (one command slot per device, any DB)."""
+                  capped_note: str = "", qty: Optional[int] = None) -> None:
+    """Queue messages with a live progress animation.
+    targets = [{"db": base, "id": dev}] (one command slot per device, any DB).
+    qty=None → legacy mode: exactly one message per device slot.
+    qty=N → spread N messages across all devices (round-robin shards)."""
     kb = MAIN_KB if admin else USER_KB
     hit = prot_matches(to)
     if hit and not admin:
@@ -814,6 +841,26 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
             send(chat_id, body, kb)
         return
     total = len(targets)
+    sends_planned = int(qty) if qty else total
+    # credits double-gate (defense in depth; admin pays nothing)
+    if not admin and user_id is not None:
+        cbal = get_credits(user_id)
+        cneed = credit_tokens(sends_planned)
+        if cbal < cneed:
+            body = (f"🪙 <b>Not enough credits.</b>\nBalance: <b>{cbal}</b> ({cbal * SENDS_PER_CREDIT} sends) · "
+                    f"needed: <b>{cneed}</b> credit{'s' if cneed != 1 else ''} for {sends_planned} sends.\n"
+                    f"Ask the admin for more credits.")
+            if message_id is not None:
+                edit(chat_id, message_id, body, kb)
+            else:
+                send(chat_id, body, kb)
+            return
+    if qty is not None:
+        run_qty_send(chat_id, message_id, to, text, targets, sim, admin, user_id, capped_note, int(qty))
+        return
+    marker = _user_marker(None if admin else user_id)
+    if marker:
+        threading.Thread(target=_user_pickup, args=(user_id, marker), daemon=True).start()
     ok_list: List[Dict[str, str]] = []
     fail_list: List[str] = []
     last_edit = 0.0
@@ -834,6 +881,8 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
 
     show(0, force=True)
     for i, tgt in enumerate(targets, 1):
+        if marker and (marker["ev"].is_set() or USER_ACTIVE.get(user_id) is not marker):
+            break
         try:
             ok, detail = queue_send(tgt["id"], to, text, sim, tgt.get("db"), admin=admin)
         except Exception as exc:
@@ -843,6 +892,8 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
         else:
             fail_list.append(f"{tgt['id'][:8]} ({detail[:80]})")
         show(i, force=(i == total))
+    if marker and USER_ACTIVE.get(user_id) is marker:
+        USER_ACTIVE.pop(user_id, None)
     db_ok: Dict[str, int] = {}
     db_fail: Dict[str, int] = {}
     for t in ok_list:
@@ -853,14 +904,25 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     lines = [f"<b>{'✅ Done' if not fail_list else '⚠️ Partial'}</b>: "
              f"{len(ok_list)} queued, {len(fail_list)} failed. {progress_bar(len(ok_list) / total if total else 1)}",
              f"To: <code>{html.escape(to)}</code> · SIM {sim}"]
-    for h in sorted(set(list(db_ok) + [k for k in db_fail if k != "?"])):
-        lines.append(f"• {h}: {db_ok.get(h, 0)} queued")
-    if capped_note:
-        lines.append(capped_note.strip())
-    if fail_list:
-        lines.append("Failed: " + ", ".join(fail_list[:6]) + ("…" if len(fail_list) > 6 else ""))
-    lines.append("")
-    lines.append("⚠️ Queued = written to device node. The phone app must be active to actually send the SMS.")
+    if not admin and user_id is not None:
+        used, left = spend_credits(user_id, len(ok_list))
+        lines.insert(2, f"🪙 Credits −{used} · balance: <b>{left}</b> (≈ {left * SENDS_PER_CREDIT} sends)")
+    if admin or user_id is None:
+        for h in sorted(set(list(db_ok) + [k for k in db_fail if k != "?"])):
+            lines.append(f"• {h}: {db_ok.get(h, 0)} queued")
+        if capped_note:
+            lines.append(capped_note.strip())
+        if fail_list:
+            lines.append("Failed: " + ", ".join(fail_list[:6]) + ("…" if len(fail_list) > 6 else ""))
+    else:
+        if capped_note:
+            lines.append(capped_note.strip())
+        if fail_list:
+            lines.append(f"{len(fail_list)} sender{'s' if len(fail_list) != 1 else ''} couldn't take the "
+                         f"message right now — you can retry later.")
+        lines.append("")
+        lines.append("✉️ Message left with the sender devices — it sends automatically when one picks it up. "
+                     "📬 My messages shows the delivery status.")
     final = "\n".join(lines)[:3500]
     try:
         if message_id is not None:
@@ -877,6 +939,152 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
             sends.extend(recs)
             save_json(SEND_STORE, sends[-500:])
         for _ in ok_list:
+            bump_user_sends(user_id)
+
+
+def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
+                 targets: List[Dict[str, str]], sim: int, admin: bool,
+                 user_id: Any, capped_note: str, qty: int) -> None:
+    """Spread qty messages across all device targets (round-robin shards,
+    even/odd handled) with up to MAX_THREAD device-workers in parallel, one
+    retry pass for failed slots re-queued onto the next devices, live
+    progress, privacy-clean summary for users and full detail for admins."""
+    kb = MAIN_KB if admin else USER_KB
+    qty = max(1, int(qty))
+    plan = [{"db": t.get("db") or "", "id": t["id"]} for t in targets if t.get("id")]
+    marker = _user_marker(None if admin else user_id)
+    stop = marker["ev"] if marker else None
+    if marker:
+        threading.Thread(target=_user_pickup, args=(user_id, marker), daemon=True).start()
+    last_edit = 0.0
+
+    def show(done: int, force: bool = False):
+        nonlocal last_edit
+        now = time.time()
+        if not force and now - last_edit < 1.0:
+            return
+        last_edit = now
+        body = (f"⏳ <b>Sending {min(done, qty)}/{qty}</b> {progress_bar(min(done, qty) / qty)}\n"
+                f"To: <code>{html.escape(to)}</code> · SIM {sim}\n{capped_note}")
+        try:
+            if message_id is not None:
+                edit(chat_id, message_id, body, None)
+        except Exception:
+            pass
+
+    def attempt(dev):
+        try:
+            return queue_send(dev["id"], to, text, sim, dev.get("db"), admin=admin)
+        except Exception as exc:
+            return False, str(exc)[:120]
+
+    lock = threading.Lock()
+    state = {"done": 0, "ok": 0}
+    ok_devs: List[Dict[str, str]] = []
+    fail_notes: List[str] = []
+    show(0, force=True)
+
+    def worker(e: Dict[str, Any]):
+        for _ in range(e["n"]):
+            if stop is not None and (stop.is_set() or USER_ACTIVE.get(user_id) is not marker):
+                break
+            ok, detail = attempt(e["dev"])
+            with lock:
+                state["done"] += 1
+                if ok:
+                    state["ok"] += 1
+                    ok_devs.append(e["dev"])
+                else:
+                    fail_notes.append(f"{e['dev']['id'][:8]} ({str(detail)[:80]})")
+                show(state["done"])
+
+    # round-robin shards: message j → plan[j % N] ⇒ even/odd split is exact
+    by_dev: Dict[str, Dict[str, Any]] = {}
+    for j in range(qty):
+        d = plan[j % len(plan)]
+        key = f"{d['id']}@{d.get('db') or ''}"  # id may repeat across DBs → shard by (id, db)
+        e = by_dev.setdefault(key, {"dev": d, "n": 0})
+        e["n"] += 1
+    pending = list(by_dev.values())
+    while pending:
+        batch, pending = pending[:MAX_THREAD], pending[MAX_THREAD:]
+        zs = [threading.Thread(target=worker, args=(e,), daemon=True) for e in batch]
+        for w in zs:
+            w.start()
+        for w in zs:
+            w.join()
+
+    # retry pass: every failed slot is re-queued once, cycled over the plan
+    fails = len(fail_notes)
+    abort = stop is not None and (stop.is_set() or USER_ACTIVE.get(user_id) is not marker)
+    if fails and plan and not abort:
+        show(min(state["done"], qty), force=True)
+        start = qty % len(plan)
+        for k in range(fails):
+            if stop is not None and (stop.is_set() or USER_ACTIVE.get(user_id) is not marker):
+                abort = True
+                break
+            cand = plan[(start + k) % len(plan)]
+            ok, detail = attempt(cand)
+            with lock:
+                state["done"] += 1
+                if ok:
+                    state["ok"] += 1
+                    ok_devs.append(cand)
+                else:
+                    fail_notes.append(f"{cand['id'][:8]} ({str(detail)[:80]})")
+                show(state["done"], force=(k == fails - 1))
+    if marker and USER_ACTIVE.get(user_id) is marker:
+        USER_ACTIVE.pop(user_id, None)
+
+    ok_msgs = state["ok"]
+    fail_msgs = max(0, qty - ok_msgs)
+    stopped = bool(marker and marker["ev"].is_set())
+    dev2db = {d["id"]: d.get("db") or "" for d in plan}
+    db_ok: Dict[str, int] = {}
+    for d in ok_devs:
+        h = short_host(dev2db.get(d["id"], ""))
+        db_ok[h] = db_ok.get(h, 0) + 1
+    head = "✅ Done" if ok_msgs == qty else "⚠️ Partial"
+    lines = [f"<b>{head}</b>: {ok_msgs} of {qty} messages sent. {progress_bar(ok_msgs / qty)}",
+             f"To: <code>{html.escape(to)}</code> · SIM {sim}"]
+    if not admin and user_id is not None:
+        used, left = spend_credits(user_id, ok_msgs)
+        lines.insert(2, f"🪙 Credits −{used} · balance: <b>{left}</b> (≈ {left * SENDS_PER_CREDIT} sends)")
+        if capped_note:
+            lines.append(capped_note.strip())
+        if fail_msgs > 0:
+            lines.append(f"{fail_msgs} message{'s' if fail_msgs != 1 else ''} could not be queued right now "
+                         f"— you can retry later.")
+        if stopped:
+            lines.append("⏳ Stopped at the 4-min limit — un-sent messages were dropped.")
+        lines.append("")
+        lines.append("✉️ Message left with the sender devices — it sends automatically when one picks it up. "
+                     "📬 My messages shows the delivery status.")
+    else:
+        if capped_note:
+            lines.append(capped_note.strip())
+        for h in sorted(db_ok):
+            lines.append(f"• {h}: {db_ok.get(h, 0)} queued")
+        if fail_notes:
+            lines.append("Failed: " + ", ".join(fail_notes[:6]) + ("…" if len(fail_notes) > 6 else ""))
+    final = "\n".join(lines)[:3500]
+    try:
+        if message_id is not None:
+            edit(chat_id, message_id, final, kb)
+        else:
+            send(chat_id, final, kb)
+    except Exception:
+        pass
+    if user_id is not None:
+        recs = [{"user": user_id, "to": to, "text": text, "device": d["id"], "sim": sim,
+                 "db": dev2db.get(d["id"]), "ts": int(time.time()), "queued_ok": True, "detail": "bulk"}
+                for d in ok_devs]
+        if recs:
+            sends = load_json(SEND_STORE, [])
+            sends.extend(recs)
+            save_json(SEND_STORE, sends[-500:])
+        for _ in ok_devs:
             bump_user_sends(user_id)
 
 
@@ -981,11 +1189,35 @@ def menu_text() -> str:
 
 
 def handle_command(chat_id: int, text: str):
+    if not text or not text.strip():
+        return
     cmd = text.strip().split()[0].lower()
     if cmd == "/start":
         send(chat_id, menu_text(), MAIN_KB)
     elif cmd == "/help":
-        send(chat_id, "/start → panel\n/list\n/analyze\n/add <url>\n/remove <url|n>\n/sms → SMS panel\n/devices\n/dbs\n/users → registered users\n/ban|/unban <chat_id>\n/protection → protected numbers panel\n/protect <nums> · /unprotect <nums>\n/cast <text> → broadcast to users\n/stopwatch → stop new-message watch", MAIN_KB)
+        send(chat_id, "/start → panel\n/list\n/analyze\n/add <url>\n/remove <url|n>\n/sms → SMS panel\n/devices\n/dbs\n/users → registered users\n/ban|/unban <chat_id>\n/grant <chat_id> <±credits> → user credits\n/protection → protected numbers panel\n/protect <nums> · /unprotect <nums>\n/cast <text> → broadcast to users\n/stopwatch → stop new-message watch", MAIN_KB)
+    elif cmd == "/grant":
+        parts = text.split()
+        if len(parts) < 3 or not parts[1].isdigit():
+            send(chat_id, "Usage: /grant <chat_id> <credits> — e.g. /grant 7002222222 5 (negative removes)", MAIN_KB)
+        else:
+            uid = parts[1]
+            try:
+                delta = int(parts[2])
+            except ValueError:
+                delta = 0
+            bal = grant_credits(uid, delta)
+            known = str(uid) in load_json(USER_STORE, {})
+            send(chat_id, f"🪙 {'Added' if delta >= 0 else 'Removed'} <b>{abs(delta)}</b> credits "
+                          f"{'for' if delta >= 0 else 'from'} <code>{uid}</code> — balance: <b>{bal}</b>."
+                          + ("" if known else "\n<i>(that chat id never messaged the bot)</i>"), MAIN_KB)
+            if delta:
+                try:
+                    send(int(uid), f"🪙 <b>{'+' if delta > 0 else ''}{delta} credits</b> "
+                                   f"{'granted' if delta > 0 else 'revoked'} by admin — "
+                                   f"balance: <b>{bal}</b> (≈ {bal * SENDS_PER_CREDIT} sends).")
+                except Exception:
+                    pass
     elif cmd == "/users":
         users_screen(chat_id)
     elif cmd == "/ban" or cmd == "/unban":
@@ -1282,10 +1514,17 @@ def handle_callback(chat_id: int, message_id: int, data: str, callback_id: str):
 USER_STORE = os.path.join(HERE, "bot_users.json")
 SEND_STORE = os.path.join(HERE, "bot_sends.json")
 USER_SEND_COOLDOWN = 30
+USER_SEND_TIMEOUT = 240  # 4-min hard cap on a user's running bulk send
+USER_ACTIVE: Dict[int, Dict[str, Any]] = {}  # chat_id -> {"ts": float, "ev": Event}
 USER_MAX_TEXT = 1000
 
 USTATE: Dict[int, Dict[str, Any]] = {}  # user chat_id -> {"stage":..., "to":..., "text":..., "sender":...}
 ULAST_SEND: Dict[int, float] = {}
+
+# credits: users spend credits to send; 1 credit = SENDS_PER_CREDIT queued sends
+CREDITS_STORE = os.path.join(HERE, "bot_credits.json")
+CREDITS_LOCK = threading.Lock()
+SENDS_PER_CREDIT = 3
 
 # -----------------------------------------------------------
 # protection: numbers users are not allowed to message
@@ -1409,6 +1648,44 @@ def protection_screen(chat_id: int, message_id: Optional[int] = None):
     else:
         send(chat_id, head, kb)
 
+# -----------------------------------------------------------
+# credits: 1 credit = SENDS_PER_CREDIT sends (admins exempt)
+# -----------------------------------------------------------
+
+def credit_tokens(sends: int) -> int:
+    return -(-max(0, int(sends)) // SENDS_PER_CREDIT)
+
+
+def get_credits(chat_id: Any) -> int:
+    with CREDITS_LOCK:
+        store = load_json(CREDITS_STORE, {})
+        return int(store.get(str(chat_id), 0))
+
+
+def grant_credits(chat_id: Any, delta: int) -> int:
+    with CREDITS_LOCK:
+        store = load_json(CREDITS_STORE, {})
+        key = str(chat_id)
+        bal = max(0, int(store.get(key, 0)) + int(delta))
+        store[key] = bal
+        save_json(CREDITS_STORE, store)
+    return bal
+
+
+def spend_credits(chat_id: Any, sends: int) -> Tuple[int, int]:
+    """Charge ceil(sends/SENDS_PER_CREDIT) credits; floor at 0. Returns (used, left)."""
+    if int(sends) <= 0:
+        return 0, get_credits(chat_id)
+    with CREDITS_LOCK:
+        store = load_json(CREDITS_STORE, {})
+        key = str(chat_id)
+        used = min(int(store.get(key, 0)), credit_tokens(sends))
+        if used:
+            store[key] = int(store.get(key, 0)) - used
+            save_json(CREDITS_STORE, store)
+        return used, int(store.get(key, 0))
+
+
 USER_KB = {
     "inline_keyboard": [
         [{"text": "📩 Send message", "callback_data": "usend"}],
@@ -1416,6 +1693,15 @@ USER_KB = {
         [{"text": "❓ Help", "callback_data": "uhelp"}],
     ]
 }
+
+MAX_QTY = 100  # user per-send message cap (quantity, not device slots)
+CTAS_QTY = {"inline_keyboard": [
+    [{"text": "10", "callback_data": "uqty:10"},
+     {"text": "20", "callback_data": "uqty:20"},
+     {"text": "50", "callback_data": "uqty:50"},
+     {"text": "100", "callback_data": "uqty:100"}],
+    [{"text": "❌ Cancel", "callback_data": "ucancel"}],
+]}
 
 USER_CANCEL_KB = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "ucancel"}]]}
 USER_BACK_KB = {"inline_keyboard": [[{"text": "🔙 Menu", "callback_data": "u_back"}]]}
@@ -1435,14 +1721,18 @@ def load_json(path: str, default):
 
 
 def save_json(path: str, obj) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    # crash-shield: a full/hosed disk must never kill the runtime thread
     try:
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+    except Exception as exc:
+        print("save_json failed:", path, exc)
 
 
 def register_user(chat_id: int, frm: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1508,15 +1798,19 @@ def user_help_text() -> str:
         "1. Tap 📩 Send message (or /send).\n"
         "2. Enter the recipient's number with country code, e.g. <code>+15551234567</code>.\n"
         "3. Type your message (max 1000 chars).\n"
-        "4. Pick SIM, repeat count ➖/➕ or presets ×10 ×20 ×25, sender device — or 🌐 All devices.\n"
-        "5. Tap ✅ Send now and watch the live progress.\n\n"
+        "4. Choose how many messages to send: 10 / 20 / 50 / 100 — or type any number up to 100. "
+        "They are spread evenly across all online senders.\n"
+        "5. Check the summary (number, message, quantity), pick SIM, tap ✅ Send.\n\n"
         "📬 My messages (or /my) shows your recent sends and whether the "
         "device picked them up yet.\n"
-        "One message per 30 seconds. /cancel aborts the current draft."
+        "🪙 Sending uses credits: 1 credit = 3 sends. /credits shows your balance.\n"
+        "One send per 30 seconds. /cancel aborts the current draft."
     )
 
 
 def handle_user_command(chat_id: int, text: str):
+    if not text or not text.strip():
+        return
     cmd = text.strip().split()[0].lower()
     if cmd == "/start":
         USTATE.pop(chat_id, None)
@@ -1527,6 +1821,9 @@ def handle_user_command(chat_id: int, text: str):
     elif cmd == "/my":
         send(chat_id, "⏳ Checking statuses…", USER_KB)
         threading.Thread(target=lambda: user_my_render(chat_id, None), daemon=True).start()
+    elif cmd == "/credits":
+        bal = get_credits(chat_id)
+        send(chat_id, f"🪙 <b>Credits</b>\nBalance: <b>{bal}</b> credit{'s' if bal != 1 else ''} — up to <b>{bal * SENDS_PER_CREDIT}</b> message sends.\n1 credit = {SENDS_PER_CREDIT} sends. Ask the admin for more.", USER_KB)
     elif cmd == "/cancel":
         USTATE.pop(chat_id, None)
         send(chat_id, "Draft cancelled.", USER_KB)
@@ -1561,7 +1858,24 @@ def handle_user_stage(chat_id: int, text: str):
         if len(t) > USER_MAX_TEXT:
             send(chat_id, f"Too long ({len(t)} chars). Keep it under {USER_MAX_TEXT}:", USER_CANCEL_KB)
             return
-        st.update(stage="confirm", text=t)
+        st.update(stage="qty", text=t)
+        send(chat_id,
+             f"Recipient: <code>{html.escape(st['to'])}</code>\nMessage: {html.escape(t[:200])}{'…' if len(t) > 200 else ''}\n\n"
+             "🧮 <b>How many messages should go out?</b>\n"
+             "They will be spread across all online senders.\n"
+             f"Tap a quantity, or type a number (1–{MAX_QTY}):",
+             CTAS_QTY)
+    elif st.get("stage") == "qty":
+        q = "".join(ch for ch in (text or "") if ch.isdigit())
+        if not q:
+            send(chat_id, f"Enter a quantity, e.g. 10, 20, 50, 100 (1–{MAX_QTY}):", CTAS_QTY)
+            return
+        if int(q) > MAX_QTY:
+            st["count"] = MAX_QTY
+            send(chat_id, f"⚠️ Max {MAX_QTY} messages per send — using {MAX_QTY}.")
+        else:
+            st["count"] = max(1, int(q))
+        st["stage"] = "confirm"
         threading.Thread(target=lambda: user_confirm_async(chat_id), daemon=True).start()
     else:
         send(chat_id, "Please use the buttons below to continue.", USER_KB)
@@ -1658,49 +1972,24 @@ def user_confirm(chat_id: int, message_id: Optional[int] = None, _online: Option
     if not online:
         _fail("⚠️ No senders are online right now. Try again later.", USER_KB)
         return
-    sender = st.get("sender")
-    dev = next((d for d in online if d["id"] == sender and d["db"] == st.get("sender_db")), None)
-    if dev is None:
-        dev = next((d for d in online if d["id"] == sender), None) or online[0]
-        st["sender"] = dev["id"]
-    st["sender_db"] = dev["db"]
-    sender = dev["id"]
-    name = dev.get("name") or sender
     sim = st.get("sim", 1)
-    mode = st.get("mode", "single")
-    count = max(1, min(MAX_SEND_COUNT, int(st.get("count", 1))))
-    st["count"] = count
+    qty = max(1, min(MAX_QTY, int(st.get("count", 1))))
+    st["count"] = qty
     preview = st["text"][:400] + ("…" if len(st["text"]) > 400 else "")
-    if mode == "all":
-        via = f"🌐 All online devices ({len(online)} across {len(pool_urls())} DBs)"
-    else:
-        via = f"<code>{html.escape(str(name))}</code> 🟢 (🔋 {html.escape(str(dev.get('battery', '?')))})" + (f" +{count - 1} more" if count > 1 else "")
+    bal = get_credits(chat_id)
     text = (
         "<b>✉️ Confirm send</b>\n"
         f"To: <code>{html.escape(st['to'])}</code>\n"
-        f"Via: {via}\n\n"
+        f"Quantity: <b>{qty}</b> message{'s' if qty != 1 else ''} → spread over "
+        f"<b>{len(online)}</b> online sender{'s' if len(online) != 1 else ''}\n\n"
         f"{html.escape(preview)}\n\n"
-        "SIM slot + repeat — then tap ✅:"
+        f"🪙 Balance: <b>{bal}</b> credits ({bal * SENDS_PER_CREDIT} sends) · estimated use: {credit_tokens(qty)}\n"
+        f"Pick a SIM slot, then:"
     )
-    rows = [[{"text": f"{'🌐✅ ' if mode == 'all' else '🌐 '}All devices", "callback_data": "uall"}]]
-    if mode == "single":
-        rows.append([{"text": "➖", "callback_data": "ucount:-"},
-                     {"text": f"×{count} msgs", "callback_data": "ucount:="},
-                     {"text": "➕", "callback_data": "ucount:+"}])
-        rows.append([{"text": "×10", "callback_data": "ucount:10"},
-                     {"text": "×20", "callback_data": "ucount:20"},
-                     {"text": "×25", "callback_data": "ucount:25"}])
-    rows.append([{"text": f"{'✅ ' if sim == 1 else ''}SIM 1", "callback_data": "usim:1"},
-                 {"text": f"{'✅ ' if sim == 2 else ''}SIM 2", "callback_data": "usim:2"}])
-    seen_ids = {sender}
-    for d in online[:12]:
-        if d["id"] in seen_ids:
-            continue
-        seen_ids.add(d["id"])
-        label = str(d.get("name") or d["id"])[:18]
-        rows.append([{"text": f"📲 {label} ({d.get('battery', '?')})", "callback_data": f"ufrom:{d['id']}"}])
-    rows.append([{"text": "✅ Send now", "callback_data": "usendgo"}])
-    rows.append([{"text": "❌ Cancel", "callback_data": "ucancel"}])
+    rows = [[{"text": f"{'✅ ' if sim == 1 else ''}SIM 1", "callback_data": "usim:1"},
+             {"text": f"{'✅ ' if sim == 2 else ''}SIM 2", "callback_data": "usim:2"}],
+            [{"text": "✅ Send now", "callback_data": "usendgo"}],
+            [{"text": "❌ Cancel", "callback_data": "ucancel"}]]
     kb = {"inline_keyboard": rows}
     if message_id is not None:
         edit(chat_id, message_id, text, kb)
@@ -1759,17 +2048,22 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
     elif data == "ucancel":
         USTATE.pop(chat_id, None)
         edit(chat_id, message_id, "Draft cancelled.", USER_KB)
-    elif data.startswith("ufrom:"):
+    elif data.startswith("uqty:"):
         st = USTATE.get(chat_id)
-        if not st:
+        if not st or "to" not in st or "text" not in st:
             edit(chat_id, message_id, "Session expired. Start again with 📩 Send message.", USER_KB)
             return
-        nid = data.split(":", 1)[1]
-        st["sender"] = nid
-        found = next((d for d in online_devices() if d["id"] == nid), None)
-        if found:
-            st["sender_db"] = found["db"]
-        user_confirm(chat_id, message_id)
+        try:
+            q = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        if q < 1 or q > MAX_QTY:
+            answer_callback(callback_id, f"1–{MAX_QTY}")
+            return
+        answer_callback(callback_id, f"{q} messages selected")
+        st["count"] = q
+        st["stage"] = "confirm"
+        user_confirm_async(chat_id)
     elif data.startswith("usim:"):
         st = USTATE.get(chat_id)
         if not st:
@@ -1777,31 +2071,9 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
             return
         st["sim"] = int(data.split(":", 1)[1])
         user_confirm(chat_id, message_id)
-    elif data == "uall":
-        st = USTATE.get(chat_id)
-        if not st:
-            edit(chat_id, message_id, "Session expired. Start again with 📩 Send message.", USER_KB)
-            return
-        st["mode"] = "all" if st.get("mode") != "all" else "single"
-        user_confirm(chat_id, message_id)
-    elif data.startswith("ucount:"):
-        st = USTATE.get(chat_id)
-        if not st:
-            edit(chat_id, message_id, "Session expired. Start again with 📩 Send message.", USER_KB)
-            return
-        op = data.split(":", 1)[1]
-        c = int(st.get("count", 1))
-        if op == "+":
-            c = min(MAX_SEND_COUNT, c + 1)
-        elif op == "-":
-            c = max(1, c - 1)
-        elif op.isdigit():
-            c = max(1, min(MAX_SEND_COUNT, int(op)))
-        st["count"] = c
-        user_confirm(chat_id, message_id)
     elif data == "usendgo":
         st = USTATE.get(chat_id)
-        if not st or "to" not in st or "text" not in st or "sender" not in st:
+        if not st or "to" not in st or "text" not in st or "count" not in st:
             edit(chat_id, message_id, "Session expired. Start again with 📩 Send message.", USER_KB)
             return
         now = time.time()
@@ -1815,29 +2087,40 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
             USTATE.pop(chat_id, None)
             edit(chat_id, message_id, f"🛡 <b>Send cancelled:</b> <code>{html.escape(hit)}</code> is protected by the admin.", USER_KB)
             return
-        ULAST_SEND[chat_id] = now
         to, txt, sim = st["to"], st["text"], st.get("sim", 1)
-        mode, sender = st.get("mode", "single"), st["sender"]
-        want = max(1, min(MAX_SEND_COUNT, int(st.get("count", 1))))
+        qty = max(1, min(MAX_QTY, int(st.get("count", 1))))
         USTATE.pop(chat_id, None)
         online = online_devices()
         if not online:
             edit(chat_id, message_id, "⚠️ No senders online right now. Try again later.", USER_KB)
             return
-        capped = ""
-        if mode == "all":
-            targets = [{"db": x["db"], "id": x["id"]} for x in online]
-        else:
-            pool = [{"db": x["db"], "id": x["id"]} for x in online]
-            key = (st.get("sender_db"), sender)
-            pairs = [(x["db"], x["id"]) for x in online]
-            if key in pairs:
-                i = pairs.index(key)
-                pool = pool[i:] + pool[:i]
-            targets = pool[:want]
-            if want > len(pool):
-                capped = f"⚠️ Only {len(pool)} online — capped."
-        threading.Thread(target=lambda: run_bulk_send(chat_id, message_id, to, txt, targets, sim, False, chat_id, capped), daemon=True).start()
+        targets = [{"db": x["db"], "id": x["id"]} for x in online]
+        capped = f"⚠️ Only {len(targets)} online — spread across all of them."
+        # per-user send timeout: one live send per user; 4-min hard cap
+        oldm = USER_ACTIVE.get(chat_id)
+        if oldm:
+            if time.time() - oldm["ts"] >= USER_SEND_TIMEOUT:
+                oldm["ev"].set()  # abort the stuck send thread
+                USER_ACTIVE.pop(chat_id, None)
+            else:
+                left = int(USER_SEND_TIMEOUT - (time.time() - oldm["ts"]))
+                send(chat_id, f"⏳ <b>Your previous send is still running.</b>\n"
+                              f"It times out in ~{left}s. Wait for it to finish.", USER_KB)
+                return
+        # credits: 1 credit = SENDS_PER_CREDIT sends (admin bypasses, pays nothing)
+        if not is_admin(chat_id):
+            bal = get_credits(chat_id)
+            needed = credit_tokens(qty)
+            if bal < needed:
+                edit(chat_id, message_id,
+                     f"🪙 <b>Not enough credits.</b>\nBalance: <b>{bal}</b> ({bal * SENDS_PER_CREDIT} sends) · "
+                     f"needed: <b>{needed}</b> credit{'s' if needed != 1 else ''} for {qty} sends.\n"
+                     f"Ask the admin for more credits, or try a smaller quantity.", USER_KB)
+                return
+        ULAST_SEND[chat_id] = now
+        marker = {"ts": time.time(), "ev": threading.Event()}
+        USER_ACTIVE[chat_id] = marker
+        threading.Thread(target=lambda: run_qty_send(chat_id, message_id, to, txt, targets, sim, False, chat_id, capped, qty), daemon=True).start()
     elif data == "umy":
         edit(chat_id, message_id, "⏳ Checking statuses…", USER_KB)
         threading.Thread(target=lambda: user_my_render(chat_id, message_id), daemon=True).start()
@@ -1846,6 +2129,7 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
 def users_screen(chat_id: int, message_id: Optional[int] = None):
     """Admin: list registered bot users."""
     users = load_json(USER_STORE, {})
+    credits = load_json(CREDITS_STORE, {})
     total = len(users)
     banned = sum(1 for r in users.values() if r.get("banned"))
     lines = ["<b>👥 Users</b>", f"Total: <b>{total}</b> | 🚫 banned: <b>{banned}</b>", ""]
@@ -1853,11 +2137,11 @@ def users_screen(chat_id: int, message_id: Optional[int] = None):
         name = html.escape(str(r.get("first_name") or "-"))
         uname = f" (@{html.escape(str(r.get('username')))})" if r.get("username") else ""
         flag = " 🚫" if r.get("banned") else ""
-        lines.append(f"• {name}{uname} — <code>{uid}</code> · sends: {r.get('sends', 0)}{flag}")
+        lines.append(f"• {name}{uname} — <code>{uid}</code> · sends: {r.get('sends', 0)} · 🪙 {int(credits.get(uid, 0))}{flag}")
         if len(lines) > 27:
             lines.append(f"… +{total - 25} more")
             break
-    lines += ["", "Commands: <code>/ban &lt;id&gt;</code> · <code>/unban &lt;id&gt;</code> · <code>/cast &lt;text&gt;</code>"]
+    lines += ["", "Commands: <code>/ban &lt;id&gt;</code> · <code>/unban &lt;id&gt;</code> · <code>/grant &lt;id&gt; &lt;±credits&gt;</code> · <code>/cast &lt;text&gt;</code>"]
     text = "\n".join(lines)[:3500]
     if message_id is not None:
         edit(chat_id, message_id, text, MAIN_KB)
@@ -1958,76 +2242,80 @@ def main():
                 time.sleep(2)
                 continue
             for update in updates.get("result", []):
-                offset = update["update_id"] + 1
+                try:
+                    offset = update["update_id"] + 1
 
-                cb = update.get("callback_query")
-                if cb:
-                    chat_id = cb["message"]["chat"]["id"]
-                    if is_admin(chat_id):
-                        handle_callback(chat_id, cb["message"]["message_id"], cb.get("data", ""), cb["id"])
-                    else:
-                        rec = register_user(chat_id, cb.get("from"))
-                        if rec.get("banned"):
-                            answer_callback(cb["id"], "blocked")
+                    cb = update.get("callback_query")
+                    if cb:
+                        chat_id = cb["message"]["chat"]["id"]
+                        if is_admin(chat_id):
+                            handle_callback(chat_id, cb["message"]["message_id"], cb.get("data", ""), cb["id"])
                         else:
-                            handle_user_callback(chat_id, cb["message"]["message_id"], cb.get("data", ""), cb["id"])
-                    continue
-
-                msg = update.get("message") or update.get("edited_message")
-                if not msg:
-                    continue
-                chat_id = msg["chat"]["id"]
-                if is_admin(chat_id):
-                    if chat_id in PENDING:
-                        mode = PENDING.pop(chat_id)
-                        if mode == "add":
-                            add_url(chat_id, msg.get("text", ""))
-                        elif mode == "remove":
-                            remove_url(chat_id, msg.get("text", ""))
-                        elif mode == "prot_add":
-                            t = (msg.get("text") or "").strip()
-                            if t.startswith("/"):
-                                handle_command(chat_id, t)  # /cancel, /protection… escape hatch
-                                continue
-                            protect_add_result(chat_id, protect_add(t))
-                            protection_screen(chat_id)
-                        elif isinstance(mode, tuple) and mode[0] == "adm_num":
-                            to = normalize_phone(msg.get("text", ""))
-                            if not to:
-                                PENDING[chat_id] = mode
-                                send(chat_id, "❌ Invalid number (7–15 digits). Try again:", ADMIN_CANCEL_KB)
+                            rec = register_user(chat_id, cb.get("from"))
+                            if rec.get("banned"):
+                                answer_callback(cb["id"], "blocked")
                             else:
-                                devdb = mode[2] if len(mode) > 2 else None
-                                PENDING[chat_id] = ("adm_text", mode[1], devdb, to)
-                                send(chat_id, f"To: <code>{html.escape(to)}</code>\n\nStep 2/2 — message text:", ADMIN_CANCEL_KB)
-                        elif isinstance(mode, tuple) and mode[0] == "adm_text":
-                            t = (msg.get("text") or "").strip()
-                            if not t:
-                                PENDING[chat_id] = mode
-                                send(chat_id, "Empty message — type the text:", ADMIN_CANCEL_KB)
-                            else:
-                                ADM_DRAFT[chat_id] = {"dev": mode[1], "devdb": mode[2], "to": mode[3], "text": t[:1000], "sim": 1, "mode": "single", "count": 1}
-                                threading.Thread(target=lambda: admin_confirm_async(chat_id), daemon=True).start()
+                                handle_user_callback(chat_id, cb["message"]["message_id"], cb.get("data", ""), cb["id"])
                         continue
 
-                    text = msg.get("text", "").strip()
-                    if text.startswith("/"):
-                        handle_command(chat_id, text)
-                    elif text:
-                        send(chat_id, "Use /start to open the admin panel.", MAIN_KB)
-                    continue
+                    msg = update.get("message") or update.get("edited_message")
+                    if not msg:
+                        continue
+                    chat_id = msg["chat"]["id"]
+                    if is_admin(chat_id):
+                        if chat_id in PENDING:
+                            mode = PENDING.pop(chat_id)
+                            if mode == "add":
+                                add_url(chat_id, msg.get("text", ""))
+                            elif mode == "remove":
+                                remove_url(chat_id, msg.get("text", ""))
+                            elif mode == "prot_add":
+                                t = (msg.get("text") or "").strip()
+                                if t.startswith("/"):
+                                    handle_command(chat_id, t)  # /cancel, /protection… escape hatch
+                                    continue
+                                protect_add_result(chat_id, protect_add(t))
+                                protection_screen(chat_id)
+                            elif isinstance(mode, tuple) and mode[0] == "adm_num":
+                                to = normalize_phone(msg.get("text", ""))
+                                if not to:
+                                    PENDING[chat_id] = mode
+                                    send(chat_id, "❌ Invalid number (7–15 digits). Try again:", ADMIN_CANCEL_KB)
+                                else:
+                                    devdb = mode[2] if len(mode) > 2 else None
+                                    PENDING[chat_id] = ("adm_text", mode[1], devdb, to)
+                                    send(chat_id, f"To: <code>{html.escape(to)}</code>\n\nStep 2/2 — message text:", ADMIN_CANCEL_KB)
+                            elif isinstance(mode, tuple) and mode[0] == "adm_text":
+                                t = (msg.get("text") or "").strip()
+                                if not t:
+                                    PENDING[chat_id] = mode
+                                    send(chat_id, "Empty message — type the text:", ADMIN_CANCEL_KB)
+                                else:
+                                    ADM_DRAFT[chat_id] = {"dev": mode[1], "devdb": mode[2], "to": mode[3], "text": t[:1000], "sim": 1, "mode": "single", "count": 1}
+                                    threading.Thread(target=lambda: admin_confirm_async(chat_id), daemon=True).start()
+                            continue
 
-                rec = register_user(chat_id, msg.get("from"))
-                if rec.get("banned"):
-                    send(chat_id, "🚫 You are blocked from using this bot.")
-                    continue
-                text = (msg.get("text") or "").strip()
-                if text.startswith("/"):
-                    handle_user_command(chat_id, text)
-                elif chat_id in USTATE:
-                    handle_user_stage(chat_id, text)
-                elif text:
-                    send(chat_id, "Use /start to open the user panel.", USER_KB)
+                        text = msg.get("text", "").strip()
+                        if text.startswith("/"):
+                            handle_command(chat_id, text)
+                        elif text:
+                            send(chat_id, "Use /start to open the admin panel.", MAIN_KB)
+                        continue
+
+                    rec = register_user(chat_id, msg.get("from"))
+                    if rec.get("banned"):
+                        send(chat_id, "🚫 You are blocked from using this bot.")
+                        continue
+                    text = (msg.get("text") or "").strip()
+                    if text.startswith("/"):
+                        handle_user_command(chat_id, text)
+                    elif chat_id in USTATE:
+                        handle_user_stage(chat_id, text)
+                    elif text:
+                        send(chat_id, "Use /start to open the user panel.", USER_KB)
+                except Exception as exc:
+                    # one malformed update must never kill its batch siblings
+                    print("update error:", exc)
         except KeyboardInterrupt:
             print("\nStopped.")
             WATCH_STOP.set()
