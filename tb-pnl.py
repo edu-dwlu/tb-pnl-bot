@@ -30,6 +30,7 @@ Usage:
 
 import base64
 import html
+import itertools
 import json
 import os
 import re
@@ -420,7 +421,7 @@ def fetch_devices(base: Optional[str] = None, force: bool = False) -> List[Dict[
                 with lock:
                     out[dev_id] = node
 
-        threads = [threading.Thread(target=worker, args=(i,)) for i in ids]
+        threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in ids]
         for t in threads:
             t.start()
         deadline = time.time() + 9
@@ -510,6 +511,8 @@ def devices_screen(chat_id: int, message_id: Optional[int] = None, edit_msg: boo
     if devices is None:
         devices = fetch_devices()
     DEV_CACHE[chat_id] = devices
+    while len(DEV_CACHE) > 40:
+        DEV_CACHE.pop(next(iter(DEV_CACHE)), None)
     view = devices_view(DEV_FILTER, devices)
     online = sum(1 for d in devices if d["status"])
     offline = len(devices) - online
@@ -841,6 +844,16 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
             send(chat_id, body, kb)
         return
     total = len(targets)
+    if total == 0:
+        body = "⚠️ <b>No senders available right now</b> — please try again in a moment."
+        try:
+            if message_id is not None:
+                edit(chat_id, message_id, body, kb)
+            else:
+                send(chat_id, body, kb)
+        except Exception:
+            pass
+        return
     sends_planned = int(qty) if qty else total
     # credits double-gate (defense in depth; admin pays nothing)
     if not admin and user_id is not None:
@@ -890,7 +903,7 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
         if ok:
             ok_list.append(tgt)
         else:
-            fail_list.append(f"{tgt['id'][:8]} ({detail[:80]})")
+            fail_list.append(f"{html.escape(str(tgt['id'])[:8])} ({html.escape(str(detail)[:80])})")
         show(i, force=(i == total))
     if marker and USER_ACTIVE.get(user_id) is marker:
         USER_ACTIVE.pop(user_id, None)
@@ -935,9 +948,7 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
         recs = [{"user": user_id, "to": to, "text": text, "device": t["id"], "sim": sim,
                  "db": t.get("db"), "ts": int(time.time()), "queued_ok": True, "detail": "bulk"} for t in ok_list]
         if recs:
-            sends = load_json(SEND_STORE, [])
-            sends.extend(recs)
-            save_json(SEND_STORE, sends[-500:])
+            log_sends(recs)
         for _ in ok_list:
             bump_user_sends(user_id)
 
@@ -952,6 +963,16 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     kb = MAIN_KB if admin else USER_KB
     qty = max(1, int(qty))
     plan = [{"db": t.get("db") or "", "id": t["id"]} for t in targets if t.get("id")]
+    if not plan:
+        body = "⚠️ <b>No senders available right now</b> — please try again in a moment."
+        try:
+            if message_id is not None:
+                edit(chat_id, message_id, body, kb)
+            else:
+                send(chat_id, body, kb)
+        except Exception:
+            pass
+        return
     marker = _user_marker(None if admin else user_id)
     stop = marker["ev"] if marker else None
     if marker:
@@ -995,7 +1016,7 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                     state["ok"] += 1
                     ok_devs.append(e["dev"])
                 else:
-                    fail_notes.append(f"{e['dev']['id'][:8]} ({str(detail)[:80]})")
+                    fail_notes.append(f"{html.escape(str(e['dev']['id'])[:8])} ({html.escape(str(detail)[:80])})")
                 show(state["done"])
 
     # round-robin shards: message j → plan[j % N] ⇒ even/odd split is exact
@@ -1032,7 +1053,7 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                     state["ok"] += 1
                     ok_devs.append(cand)
                 else:
-                    fail_notes.append(f"{cand['id'][:8]} ({str(detail)[:80]})")
+                    fail_notes.append(f"{html.escape(str(cand['id'])[:8])} ({html.escape(str(detail)[:80])})")
                 show(state["done"], force=(k == fails - 1))
     if marker and USER_ACTIVE.get(user_id) is marker:
         USER_ACTIVE.pop(user_id, None)
@@ -1040,10 +1061,9 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     ok_msgs = state["ok"]
     fail_msgs = max(0, qty - ok_msgs)
     stopped = bool(marker and marker["ev"].is_set())
-    dev2db = {d["id"]: d.get("db") or "" for d in plan}
     db_ok: Dict[str, int] = {}
     for d in ok_devs:
-        h = short_host(dev2db.get(d["id"], ""))
+        h = short_host(d.get("db") or "")
         db_ok[h] = db_ok.get(h, 0) + 1
     head = "✅ Done" if ok_msgs == qty else "⚠️ Partial"
     lines = [f"<b>{head}</b>: {ok_msgs} of {qty} messages sent. {progress_bar(ok_msgs / qty)}",
@@ -1078,12 +1098,10 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
         pass
     if user_id is not None:
         recs = [{"user": user_id, "to": to, "text": text, "device": d["id"], "sim": sim,
-                 "db": dev2db.get(d["id"]), "ts": int(time.time()), "queued_ok": True, "detail": "bulk"}
+                 "db": d.get("db"), "ts": int(time.time()), "queued_ok": True, "detail": "bulk"}
                 for d in ok_devs]
         if recs:
-            sends = load_json(SEND_STORE, [])
-            sends.extend(recs)
-            save_json(SEND_STORE, sends[-500:])
+            log_sends(recs)
         for _ in ok_devs:
             bump_user_sends(user_id)
 
@@ -1257,7 +1275,8 @@ def handle_command(chat_id: int, text: str):
         if len(parts) < 2 or not parts[1].strip():
             send(chat_id, "Usage: /cast <message>", MAIN_KB)
         else:
-            admin_broadcast(chat_id, parts[1].strip())
+            send(chat_id, "📢 Broadcasting… (I'll confirm when done.)", MAIN_KB)
+            threading.Thread(target=lambda p: admin_broadcast(chat_id, p), args=(parts[1].strip(),), daemon=True).start()
     elif cmd == "/list":
         urls = load_urls()
         send(chat_id, "Stored:\n" + ("\n".join(f"{i+1}. {u}" for i, u in enumerate(urls)) if urls else "(none)"), MAIN_KB)
@@ -1520,6 +1539,7 @@ USER_MAX_TEXT = 1000
 
 USTATE: Dict[int, Dict[str, Any]] = {}  # user chat_id -> {"stage":..., "to":..., "text":..., "sender":...}
 ULAST_SEND: Dict[int, float] = {}
+_STATE_LOCK = threading.Lock()  # serializes register_user/bump_user_sends/log_send read-modify-write cycles
 
 # credits: users spend credits to send; 1 credit = SENDS_PER_CREDIT queued sends
 CREDITS_STORE = os.path.join(HERE, "bot_credits.json")
@@ -1720,10 +1740,13 @@ def load_json(path: str, default):
         return default
 
 
+_TMP_COUNTER = itertools.count()
+
+
 def save_json(path: str, obj) -> None:
     # crash-shield: a full/hosed disk must never kill the runtime thread
     try:
-        tmp = path + ".tmp"
+        tmp = f"{path}.tmp.{os.getpid()}.{next(_TMP_COUNTER)}"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=1)
         os.replace(tmp, path)
@@ -1736,35 +1759,47 @@ def save_json(path: str, obj) -> None:
 
 
 def register_user(chat_id: int, frm: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    users = load_json(USER_STORE, {})
-    key = str(chat_id)
-    rec = users.get(key, {})
-    if frm:
-        if frm.get("first_name"):
-            rec["first_name"] = frm.get("first_name")
-        if frm.get("username"):
-            rec["username"] = frm.get("username")
-    rec.setdefault("joined", time.strftime("%Y-%m-%d %H:%M"))
-    rec.setdefault("banned", False)
-    rec.setdefault("sends", 0)
-    users[key] = rec
-    save_json(USER_STORE, users)
-    return rec
+    with _STATE_LOCK:
+        users = load_json(USER_STORE, {})
+        key = str(chat_id)
+        rec = users.get(key, {})
+        if frm:
+            if frm.get("first_name"):
+                rec["first_name"] = frm.get("first_name")
+            if frm.get("username"):
+                rec["username"] = frm.get("username")
+        rec.setdefault("joined", time.strftime("%Y-%m-%d %H:%M"))
+        rec.setdefault("banned", False)
+        rec.setdefault("sends", 0)
+        users[key] = rec
+        save_json(USER_STORE, users)
+        return rec
 
 
 def bump_user_sends(chat_id: int) -> None:
-    users = load_json(USER_STORE, {})
-    key = str(chat_id)
-    rec = users.get(key, {})
-    rec["sends"] = int(rec.get("sends", 0)) + 1
-    users[key] = rec
-    save_json(USER_STORE, users)
+    with _STATE_LOCK:
+        users = load_json(USER_STORE, {})
+        key = str(chat_id)
+        rec = users.get(key, {})
+        rec["sends"] = int(rec.get("sends", 0)) + 1
+        users[key] = rec
+        save_json(USER_STORE, users)
 
 
 def log_send(rec: Dict[str, Any]) -> None:
-    sends = load_json(SEND_STORE, [])
-    sends.append(rec)
-    save_json(SEND_STORE, sends[-500:])
+    with _STATE_LOCK:
+        sends = load_json(SEND_STORE, [])
+        sends.append(rec)
+        save_json(SEND_STORE, sends[-500:])
+
+
+def log_sends(recs: List[Dict[str, Any]]) -> None:
+    if not recs:
+        return
+    with _STATE_LOCK:
+        sends = load_json(SEND_STORE, [])
+        sends.extend(recs)
+        save_json(SEND_STORE, sends[-500:])
 
 
 def user_sends_list(chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
@@ -2118,6 +2153,10 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
                      f"Ask the admin for more credits, or try a smaller quantity.", USER_KB)
                 return
         ULAST_SEND[chat_id] = now
+        if len(ULAST_SEND) > 500:
+            cutoff = now - USER_SEND_COOLDOWN
+            for k in [k for k, v in ULAST_SEND.items() if v < cutoff]:
+                ULAST_SEND.pop(k, None)
         marker = {"ts": time.time(), "ev": threading.Event()}
         USER_ACTIVE[chat_id] = marker
         threading.Thread(target=lambda: run_qty_send(chat_id, message_id, to, txt, targets, sim, False, chat_id, capped, qty), daemon=True).start()
@@ -2150,7 +2189,11 @@ def users_screen(chat_id: int, message_id: Optional[int] = None):
 
 
 def admin_broadcast(chat_id: int, text: str):
-    users = load_json(USER_STORE, {})
+    try:
+        users = load_json(USER_STORE, {})
+    except Exception as exc:
+        send(chat_id, f"📢 Broadcast failed: {exc}", MAIN_KB)
+        return
     targets = [int(uid) for uid, r in users.items() if not r.get("banned") and uid.isdigit()]
     if not targets:
         send(chat_id, "No users to broadcast to.", MAIN_KB)
