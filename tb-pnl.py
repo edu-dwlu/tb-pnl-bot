@@ -175,16 +175,16 @@ def get_updates(offset: Optional[int]) -> Dict[str, Any]:
 
 MAIN_KB = {
     "inline_keyboard": [
-        [{"text": "💬 SMS Panel", "callback_data": "smslist"}],
-        [{"text": "📱 Devices", "callback_data": "devrefresh"}],
-        [{"text": "🗂 Databases", "callback_data": "dbpanel"}],
-        [{"text": "👥 Users", "callback_data": "users"}],
-        [{"text": "🛡 Protection", "callback_data": "prot"}],
-        [{"text": "➕ Add URL", "callback_data": "add"},
-         {"text": "📋 List URLs", "callback_data": "list"}],
-        [{"text": "🔎 Analyze All", "callback_data": "analyze"},
-         {"text": "🗑 Remove", "callback_data": "remove"}],
-        [{"text": "ℹ️ Help", "callback_data": "help"}],
+        [{"text": "💬 SMS Panel", "callback_data": "smslist", "style": "primary"}],
+        [{"text": "📱 Devices", "callback_data": "devrefresh", "style": "primary"}],
+        [{"text": "🗂 Databases", "callback_data": "dbpanel", "style": "primary"}],
+        [{"text": "👥 Users", "callback_data": "users", "style": "primary"}],
+        [{"text": "🛡 Protection", "callback_data": "prot", "style": "primary"}],
+        [{"text": "➕ Add URL", "callback_data": "add", "style": "success"},
+         {"text": "📋 List URLs", "callback_data": "list", "style": "primary"}],
+        [{"text": "🔎 Analyze All", "callback_data": "analyze", "style": "primary"},
+         {"text": "🗑 Remove", "callback_data": "remove", "style": "danger"}],
+        [{"text": "ℹ️ Help", "callback_data": "help", "style": "primary"}],
     ]
 }
 
@@ -496,14 +496,14 @@ def devices_kb() -> Dict[str, Any]:
     f, s = DEV_FILTER["f"], DEV_FILTER["s"]
     mark = lambda x: ("• " if x else "") + x
     return {"inline_keyboard": [
-        [{"text": f"{'📋' if f=='all' else ''} All", "callback_data": f"devf:all"},
-         {"text": ("🟢 " if f == "online" else "") + "Online", "callback_data": "devf:online"},
-         {"text": ("⚫ " if f == "offline" else "") + "Offline", "callback_data": "devf:offline"}],
-        [{"text": ("🆕 " if s == "new" else "") + "Newest", "callback_data": "devs:new"},
-         {"text": ("📅 " if s == "old" else "") + "Oldest", "callback_data": "devs:old"},
-         {"text": ("🔤 " if s == "name" else "") + "Name", "callback_data": "devs:name"},
-         {"text": ("🔋 " if s == "battery" else "") + "Battery", "callback_data": "devs:battery"}],
-        [{"text": "🔙 Back", "callback_data": "back"}],
+        [{"text": f"{'📋' if f=='all' else ''} All", "callback_data": f"devf:all", "style": "success" if f == "all" else "primary"},
+         {"text": ("🟢 " if f == "online" else "") + "Online", "callback_data": "devf:online", "style": "success" if f == "online" else "primary"},
+         {"text": ("⚫ " if f == "offline" else "") + "Offline", "callback_data": "devf:offline", "style": "success" if f == "offline" else "primary"}],
+        [{"text": ("🆕 " if s == "new" else "") + "Newest", "callback_data": "devs:new", "style": "success" if s == "new" else "primary"},
+         {"text": ("📅 " if s == "old" else "") + "Oldest", "callback_data": "devs:old", "style": "success" if s == "old" else "primary"},
+         {"text": ("🔤 " if s == "name" else "") + "Name", "callback_data": "devs:name", "style": "success" if s == "name" else "primary"},
+         {"text": ("🔋 " if s == "battery" else "") + "Battery", "callback_data": "devs:battery", "style": "success" if s == "battery" else "primary"}],
+        [{"text": "🔙 Back", "callback_data": "back", "style": "primary"}],
     ]}
 
 
@@ -525,7 +525,7 @@ def devices_screen(chat_id: int, message_id: Optional[int] = None, edit_msg: boo
         lines.append(f"{marker} <b>{d['name']}</b> — 🔋{d['battery']} | {d['phoneNumber']}")
     kb = devices_kb()
     kb["inline_keyboard"] = [
-        [{"text": d["name"][:24], "callback_data": f"dev:{d['id']}"}] for d in view[:12]
+        [{"text": d["name"][:24], "callback_data": f"dev:{d['id']}", "style": "primary"}] for d in view[:12]
     ] + kb["inline_keyboard"]
     text = "\n".join(lines)
     if edit_msg and message_id is not None:
@@ -540,7 +540,7 @@ def device_detail(dev_id: str, chat_id: int, message_id: Optional[int] = None):
         edit(chat_id, message_id, f"Device {dev_id} not found.", devices_kb())
         return
     dev = parse_devices({dev_id: node})[0]
-    kb = {"inline_keyboard": [[{"text": "🔙 Devices", "callback_data": "devrefresh"}]]}
+    kb = {"inline_keyboard": [[{"text": "🔙 Devices", "callback_data": "devrefresh", "style": "primary"}]]}
     text = (f"<b>{dev['name']}</b> ({'🟢 online' if dev['status'] else '⚫ offline'})\n"
             f"ID: <code>{dev['id']}</code>\n🔋 {dev['battery']} | 📱 {dev['phoneNumber']} ({dev['provider']})\n"
             f"🤖 {dev['android']} | sdk {dev['sdk']} | cpu {dev['cpu']}\n"
@@ -570,11 +570,11 @@ def sms_threads(chat_id=None, message_id=None, online_only: bool = True) -> str:
         lines.append(f"({skipped} offline thread(s) hidden)")
     kb = {"inline_keyboard": []}
     for p in phones[:MAX_PHONES_LIST]:
-        kb["inline_keyboard"].append([{"text": f"📱 {p}", "callback_data": f"thread:{p}"}])
+        kb["inline_keyboard"].append([{"text": f"📱 {p}", "callback_data": f"thread:{p}", "style": "primary"}])
     if not phones:
         lines.append("No online devices with chat threads.")
-        kb["inline_keyboard"].append([{"text": "👀 Show all (incl. offline)", "callback_data": "smsall"}])
-    kb["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "back"}])
+        kb["inline_keyboard"].append([{"text": "👀 Show all (incl. offline)", "callback_data": "smsall", "style": "primary"}])
+    kb["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "back", "style": "primary"}])
     text = "\n".join(lines)
     if message_id is not None and chat_id is not None:
         edit(chat_id, message_id, text, kb)
@@ -693,10 +693,10 @@ def thread_header(dev_id: str) -> str:
 def sms_thread(phone: str, chat_id=None, message_id=None) -> str:
     data = fb_get(f"messages/{phone}")
     kb_rows = [
-        [{"text": "🔄 Refresh", "callback_data": f"thread:{phone}"},
-         {"text": "👁 Watch", "callback_data": f"watch:{phone}"}],
-        [{"text": "✉️ Send", "callback_data": f"send:{phone}"},
-         {"text": "🔙 Back", "callback_data": "smslist"}],
+        [{"text": "🔄 Refresh", "callback_data": f"thread:{phone}", "style": "primary"},
+         {"text": "👁 Watch", "callback_data": f"watch:{phone}", "style": "primary"}],
+        [{"text": "✉️ Send", "callback_data": f"send:{phone}", "style": "success"},
+         {"text": "🔙 Back", "callback_data": "smslist", "style": "primary"}],
     ]
     if not isinstance(data, dict) or "error" in data:
         msg = f"{thread_header(phone)}\n\nNo messages yet."
@@ -753,7 +753,7 @@ def start_watch(phone: str, chat_id: int):
     WATCH["phone"] = phone
     WATCH["chat"] = chat_id
     WATCH["ids"] = set(fb_shallow(f"messages/{phone}"))
-    send(chat_id, f"👁 Watching <b>{phone}</b> for new messages (every {WATCH_INTERVAL}s). Use ⏹ Stop to end.", {"inline_keyboard": [[{"text": "⏹ Stop watch", "callback_data": "watchoff"}]]})
+    send(chat_id, f"👁 Watching <b>{phone}</b> for new messages (every {WATCH_INTERVAL}s). Use ⏹ Stop to end.", {"inline_keyboard": [[{"text": "⏹ Stop watch", "callback_data": "watchoff", "style": "danger"}]]})
 
 
 def stop_watch(chat_id: int):
@@ -763,7 +763,7 @@ def stop_watch(chat_id: int):
 
 
 ADM_DRAFT: Dict[int, Dict[str, Any]] = {}  # admin chat -> {"dev":..., "to":..., "text":..., "sim":...}
-ADMIN_CANCEL_KB = {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "smslist"}]]}
+ADMIN_CANCEL_KB = {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "smslist", "style": "danger"}]]}
 
 
 def queue_send(dev_id: str, target: str, text: str, sim: int = 1, base: Optional[str] = None,
@@ -781,10 +781,18 @@ def queue_send(dev_id: str, target: str, text: str, sim: int = 1, base: Optional
     payload = {"from": sim, "to": target, "message": text, "isSended": False}
     r = fb_put_db(base, f"clients/{dev_id}/webhookEvent/sendSms", payload)
     if isinstance(r, dict) and r.get("error"):
-        return False, f"write failed: {r['error']}"
+        detail = f"write failed: {r['error']}"
+        dev_stats_record(base, dev_id, False, detail)
+        return False, detail
     back = fb_get_db(base, f"clients/{dev_id}/webhookEvent/sendSms")
+    if isinstance(back, dict) and ("error" in back or "_status" in back):
+        # read-back inconclusive (network/DB hiccup, non-JSON) — don't blame the device
+        return False, f"verify inconclusive — could not read back the node (got: {str(back)[:80]})"
     if not (isinstance(back, dict) and back.get("message") == text and str(back.get("to")) == str(target)):
-        return False, f"verify failed — device node does not show our message (got: {str(back)[:120]})"
+        detail = f"verify failed — device node does not show our message (got: {str(back)[:120]})"
+        dev_stats_record(base, dev_id, False, detail)
+        return False, detail
+    dev_stats_record(base, dev_id, True, "queued on device")
     now = int(time.time() * 1000)
     fb_put_db(base, f"messages/{dev_id}/{now}", {"id": now, "dateTime": time.strftime("%d-%m-%Y | %I:%M %p"), "message": text, "sender": "me", "type": "outgoing"})
     return True, "queued on device — waiting for the phone app to send it"
@@ -797,9 +805,16 @@ def progress_bar(frac: float, width: int = 10) -> str:
 
 
 def online_devices() -> List[Dict[str, Any]]:
-    """Online devices across the whole send pool (all admin-enabled DBs)."""
+    """Online devices across the whole send pool (all admin-enabled DBs),
+    minus devices currently benched by auto-quarantine."""
     try:
-        return [d for d in fetch_all_devices() if d.get("status")]
+        benched = dev_benched_set()
+        devs = fetch_all_devices()
+        out = [d for d in devs if d.get("status") and _dev_key(d.get("db"), d["id"]) not in benched]
+        if not out:
+            # quarantine would empty the pool — ignore it, some capacity beats none
+            out = [d for d in devs if d.get("status")]
+        return out
     except Exception:
         return []
 
@@ -876,6 +891,7 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
         threading.Thread(target=_user_pickup, args=(user_id, marker), daemon=True).start()
     ok_list: List[Dict[str, str]] = []
     fail_list: List[str] = []
+    failed_pairs: List[Tuple[Optional[str], str]] = []
     last_edit = 0.0
 
     def show(i: int, force: bool = False):
@@ -904,6 +920,7 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
             ok_list.append(tgt)
         else:
             fail_list.append(f"{html.escape(str(tgt['id'])[:8])} ({html.escape(str(detail)[:80])})")
+            failed_pairs.append((tgt.get("db"), tgt["id"]))
         show(i, force=(i == total))
     if marker and USER_ACTIVE.get(user_id) is marker:
         USER_ACTIVE.pop(user_id, None)
@@ -923,6 +940,9 @@ def run_bulk_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     if admin or user_id is None:
         for h in sorted(set(list(db_ok) + [k for k in db_fail if k != "?"])):
             lines.append(f"• {h}: {db_ok.get(h, 0)} queued")
+        bh = dev_bench_report(failed_pairs)
+        if bh:
+            lines.append(f"🩺 auto-benched this run: {', '.join(bh[:8])}{'…' if len(bh) > 8 else ''} (cooldown active)")
         if capped_note:
             lines.append(capped_note.strip())
         if fail_list:
@@ -1003,6 +1023,7 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     state = {"done": 0, "ok": 0}
     ok_devs: List[Dict[str, str]] = []
     fail_notes: List[str] = []
+    failed_pairs: List[Tuple[Optional[str], str]] = []
     show(0, force=True)
 
     def worker(e: Dict[str, Any]):
@@ -1017,6 +1038,7 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                     ok_devs.append(e["dev"])
                 else:
                     fail_notes.append(f"{html.escape(str(e['dev']['id'])[:8])} ({html.escape(str(detail)[:80])})")
+                    failed_pairs.append((e["dev"].get("db"), e["dev"]["id"]))
                 show(state["done"])
 
     # round-robin shards: message j → plan[j % N] ⇒ even/odd split is exact
@@ -1054,6 +1076,7 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                     ok_devs.append(cand)
                 else:
                     fail_notes.append(f"{html.escape(str(cand['id'])[:8])} ({html.escape(str(detail)[:80])})")
+                    failed_pairs.append((cand.get("db"), cand["id"]))
                 show(state["done"], force=(k == fails - 1))
     if marker and USER_ACTIVE.get(user_id) is marker:
         USER_ACTIVE.pop(user_id, None)
@@ -1086,6 +1109,9 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
             lines.append(capped_note.strip())
         for h in sorted(db_ok):
             lines.append(f"• {h}: {db_ok.get(h, 0)} queued")
+        bh = dev_bench_report(failed_pairs)
+        if bh:
+            lines.append(f"🩺 auto-benched this run: {', '.join(bh[:8])}{'…' if len(bh) > 8 else ''} (cooldown active)")
         if fail_notes:
             lines.append("Failed: " + ", ".join(fail_notes[:6]) + ("…" if len(fail_notes) > 6 else ""))
     final = "\n".join(lines)[:3500]
@@ -1147,18 +1173,18 @@ def admin_send_confirm(chat_id: int, message_id: Optional[int] = None, _online: 
         shield = f"\n🛡 <b>Warning:</b> <code>{html.escape(hit)}</code> is protected — sending anyway (admin bypass)."
     text = (f"<b>✉️ Confirm send</b>{shield}\nTo: <code>{html.escape(d['to'])}</code>\n"
             f"Via: {via}\n\n{html.escape(preview)}\n\nSIM slot + repeat:")
-    rows = [[{"text": f"{'🌐✅ ' if mode == 'all' else '🌐 '}All devices", "callback_data": "aall"}]]
+    rows = [[{"text": f"{'🌐✅ ' if mode == 'all' else '🌐 '}All devices", "callback_data": "aall", "style": "success" if mode == "all" else "primary"}]]
     if mode == "single":
-        rows.append([{"text": "➖", "callback_data": "acount:-"},
-                     {"text": f"×{count} msgs", "callback_data": "acount:="},
-                     {"text": "➕", "callback_data": "acount:+"}])
-        rows.append([{"text": "×10", "callback_data": "acount:10"},
-                     {"text": "×20", "callback_data": "acount:20"},
-                     {"text": "×25", "callback_data": "acount:25"}])
-    rows.append([{"text": f"{'✅ ' if sim == 1 else ''}SIM 1", "callback_data": "asim:1"},
-                 {"text": f"{'✅ ' if sim == 2 else ''}SIM 2", "callback_data": "asim:2"}])
-    rows.append([{"text": "✅ Send now", "callback_data": "asendgo"}])
-    rows.append([{"text": "❌ Cancel", "callback_data": "ascancel"}])
+        rows.append([{"text": "➖", "callback_data": "acount:-", "style": "primary"},
+                     {"text": f"×{count} msgs", "callback_data": "acount:=", "style": "primary"},
+                     {"text": "➕", "callback_data": "acount:+", "style": "primary"}])
+        rows.append([{"text": "×10", "callback_data": "acount:10", "style": "primary"},
+                     {"text": "×20", "callback_data": "acount:20", "style": "primary"},
+                     {"text": "×25", "callback_data": "acount:25", "style": "primary"}])
+    rows.append([{"text": f"{'✅ ' if sim == 1 else ''}SIM 1", "callback_data": "asim:1", "style": "success" if sim == 1 else "primary"},
+                 {"text": f"{'✅ ' if sim == 2 else ''}SIM 2", "callback_data": "asim:2", "style": "success" if sim == 2 else "primary"}])
+    rows.append([{"text": "✅ Send now", "callback_data": "asendgo", "style": "success"}])
+    rows.append([{"text": "❌ Cancel", "callback_data": "ascancel", "style": "danger"}])
     kb = {"inline_keyboard": rows}
     if message_id is not None:
         edit(chat_id, message_id, text, kb)
@@ -1351,11 +1377,11 @@ def databases_screen(chat_id: int, message_id: Optional[int] = None):
         host = u.split("//")[-1][:26]
         in_pool = u.rstrip("/") in [p.rstrip("/") for p in pool]
         kb["inline_keyboard"].append([
-            {"text": f"{mark}{host}", "callback_data": f"seldb:{i}"},
-            {"text": f"{'✅ Pool' if in_pool else '➕ Pool'}", "callback_data": f"pooldb:{i}"},
+            {"text": f"{mark}{host}", "callback_data": f"seldb:{i}", "style": "success" if u == active else "primary"},
+            {"text": f"{'✅ Pool' if in_pool else '➕ Pool'}", "callback_data": f"pooldb:{i}", "style": "success" if in_pool else "primary"},
         ])
-    kb["inline_keyboard"].append([{"text": "➕ Add DB", "callback_data": "add"},
-                                  {"text": "🔙 Back", "callback_data": "back"}])
+    kb["inline_keyboard"].append([{"text": "➕ Add DB", "callback_data": "add", "style": "success"},
+                                  {"text": "🔙 Back", "callback_data": "back", "style": "primary"}])
     text = "\n".join(lines) if urls else "No databases yet. Tap ➕ Add DB and paste a firebase URL or a legendpannel ?m= link."
     if message_id is not None:
         edit(chat_id, message_id, text, kb)
@@ -1547,6 +1573,102 @@ CREDITS_LOCK = threading.Lock()
 SENDS_PER_CREDIT = 3
 
 # -----------------------------------------------------------
+# device health: serially-failing senders get benched for a while
+# -----------------------------------------------------------
+
+DEVSTATS_STORE = os.path.join(HERE, "bot_devstats.json")
+DEVSTATS_LOCK = threading.Lock()
+DEVQUAR_FAILS = 3            # consecutive verify-fails → bench the device
+DEVQUAR_COOLDOWN = 15 * 60   # first bench: 15 min, doubles each relapse
+DEVQUAR_CAP = 120 * 60       # bench cap: 2 h
+DEVSTATS_TTL = 6 * 3600      # entries pruned 6 h after their bench expires
+
+
+def _dev_key(db: Optional[str], dev_id: str) -> str:
+    return f"{(db or '').rstrip('/')}|{dev_id}"
+
+
+def _f(v: Any, default: float = 0.0) -> float:
+    """Corrupt-field safe float coercion — one bad entry must not break recording."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def dev_stats_record(db: Optional[str], dev_id: str, ok: bool, detail: str) -> None:
+    """Send outcome bookkeeping. Success clears the device; a verify-failed
+    send (node got overwritten/stale = device-side problem) bumps its fail
+    count and benches it at the threshold. write-failures blame the
+    database, not the device, and are ignored."""
+    key = _dev_key(db, dev_id)
+    now = time.time()
+    try:
+        with DEVSTATS_LOCK:
+            store = load_json(DEVSTATS_STORE, {})
+            if not isinstance(store, dict):
+                store = {}
+            changed = False
+            if ok:
+                if key in store:
+                    store.pop(key, None)
+                    save_json(DEVSTATS_STORE, store)
+                return
+            if not str(detail or "").startswith("verify failed"):
+                return
+            for k in [k for k, v in store.items() if isinstance(v, dict)
+                      and 0 < _f(v.get("until")) < now - DEVSTATS_TTL]:
+                store.pop(k, None)
+                changed = True
+            e = store.get(key)
+            if not isinstance(e, dict):
+                e = {"fails": 0.0, "until": 0.0, "strikes": 0.0}
+                store[key] = e
+                changed = True
+            if now < _f(e.get("until")):
+                # still benched — don't extend mid-bench; persist only if prune changed something
+                if changed:
+                    save_json(DEVSTATS_STORE, store)
+                return
+            e["fails"] = _f(e.get("fails")) + 1
+            if e["fails"] >= DEVQUAR_FAILS:
+                strikes = _f(e.get("strikes"))
+                e["strikes"] = strikes + 1
+                e["fails"] = 0.0
+                e["until"] = now + min(DEVQUAR_COOLDOWN * (2 ** min(int(strikes), 4)), DEVQUAR_CAP)
+            store[key] = e
+            save_json(DEVSTATS_STORE, store)
+    except Exception:
+        pass  # health bookkeeping must never break a send
+
+
+def dev_benched_set() -> set:
+    """Keys `(db)|id` that are benched right now."""
+    try:
+        with DEVSTATS_LOCK:
+            store = load_json(DEVSTATS_STORE, {})
+        now = time.time()
+        return {k for k, e in store.items()
+                if isinstance(e, dict) and now < _f(e.get("until"))}
+    except Exception:
+        return set()
+
+
+def dev_bench_report(pairs: List[Tuple[Optional[str], str]]) -> List[str]:
+    """Which of the send's failed slots are currently benched (admin summary)."""
+    try:
+        benched = dev_benched_set()
+    except Exception:
+        return []
+    seen, out = set(), []
+    for db, did in pairs:
+        k = _dev_key(db, did)
+        if k in benched and k not in seen:
+            seen.add(k)
+            out.append(str(did)[:8])
+    return out
+
+# -----------------------------------------------------------
 # protection: numbers users are not allowed to message
 # -----------------------------------------------------------
 
@@ -1656,12 +1778,12 @@ def protection_screen(chat_id: int, message_id: Optional[int] = None):
     if not keys:
         head += "\n\nNo numbers protected yet."
     kb_rows: List[List[Dict[str, str]]] = [
-        [{"text": "➕ Add numbers", "callback_data": "prot:add"}]]
+        [{"text": "➕ Add numbers", "callback_data": "prot:add", "style": "success"}]]
     for k in keys[:40]:
-        kb_rows.append([{"text": f"🛡 {k} — unprotect", "callback_data": f"prot:off:{k}"}])
+        kb_rows.append([{"text": f"🛡 {k} — unprotect", "callback_data": f"prot:off:{k}", "style": "danger"}])
     if total > 40:
         kb_rows.append([{"text": f"… +{total - 40} more (use /unprotect)", "callback_data": "noop"}])
-    kb_rows.append([{"text": "🔙 Menu", "callback_data": "back"}])
+    kb_rows.append([{"text": "🔙 Menu", "callback_data": "back", "style": "primary"}])
     kb = {"inline_keyboard": kb_rows}
     if message_id is not None:
         edit(chat_id, message_id, head, kb)
@@ -1708,23 +1830,23 @@ def spend_credits(chat_id: Any, sends: int) -> Tuple[int, int]:
 
 USER_KB = {
     "inline_keyboard": [
-        [{"text": "📩 Send message", "callback_data": "usend"}],
-        [{"text": "📬 My messages", "callback_data": "umy"}],
-        [{"text": "❓ Help", "callback_data": "uhelp"}],
+        [{"text": "📩 Send message", "callback_data": "usend", "style": "success"}],
+        [{"text": "📬 My messages", "callback_data": "umy", "style": "primary"}],
+        [{"text": "❓ Help", "callback_data": "uhelp", "style": "primary"}],
     ]
 }
 
 MAX_QTY = 100  # user per-send message cap (quantity, not device slots)
 CTAS_QTY = {"inline_keyboard": [
-    [{"text": "10", "callback_data": "uqty:10"},
-     {"text": "20", "callback_data": "uqty:20"},
-     {"text": "50", "callback_data": "uqty:50"},
-     {"text": "100", "callback_data": "uqty:100"}],
-    [{"text": "❌ Cancel", "callback_data": "ucancel"}],
+    [{"text": "10", "callback_data": "uqty:10", "style": "primary"},
+     {"text": "20", "callback_data": "uqty:20", "style": "primary"},
+     {"text": "50", "callback_data": "uqty:50", "style": "primary"},
+     {"text": "100", "callback_data": "uqty:100", "style": "primary"}],
+    [{"text": "❌ Cancel", "callback_data": "ucancel", "style": "danger"}],
 ]}
 
-USER_CANCEL_KB = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "ucancel"}]]}
-USER_BACK_KB = {"inline_keyboard": [[{"text": "🔙 Menu", "callback_data": "u_back"}]]}
+USER_CANCEL_KB = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "ucancel", "style": "danger"}]]}
+USER_BACK_KB = {"inline_keyboard": [[{"text": "🔙 Menu", "callback_data": "u_back", "style": "primary"}]]}
 
 
 def is_admin(chat_id) -> bool:
@@ -2021,10 +2143,10 @@ def user_confirm(chat_id: int, message_id: Optional[int] = None, _online: Option
         f"🪙 Balance: <b>{bal}</b> credits ({bal * SENDS_PER_CREDIT} sends) · estimated use: {credit_tokens(qty)}\n"
         f"Pick a SIM slot, then:"
     )
-    rows = [[{"text": f"{'✅ ' if sim == 1 else ''}SIM 1", "callback_data": "usim:1"},
-             {"text": f"{'✅ ' if sim == 2 else ''}SIM 2", "callback_data": "usim:2"}],
-            [{"text": "✅ Send now", "callback_data": "usendgo"}],
-            [{"text": "❌ Cancel", "callback_data": "ucancel"}]]
+    rows = [[{"text": f"{'✅ ' if sim == 1 else ''}SIM 1", "callback_data": "usim:1", "style": "success" if sim == 1 else "primary"},
+             {"text": f"{'✅ ' if sim == 2 else ''}SIM 2", "callback_data": "usim:2", "style": "success" if sim == 2 else "primary"}],
+            [{"text": "✅ Send now", "callback_data": "usendgo", "style": "success"}],
+            [{"text": "❌ Cancel", "callback_data": "ucancel", "style": "danger"}]]
     kb = {"inline_keyboard": rows}
     if message_id is not None:
         edit(chat_id, message_id, text, kb)
@@ -2049,8 +2171,8 @@ def send_live_status(rec: Dict[str, Any]) -> str:
 
 def user_my_render(chat_id: int, message_id: Optional[int] = None):
     mine = user_sends_list(chat_id)
-    kb = {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "umy"}],
-                              [{"text": "🔙 Menu", "callback_data": "u_back"}]]}
+    kb = {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "umy", "style": "primary"}],
+                              [{"text": "🔙 Menu", "callback_data": "u_back", "style": "primary"}]]}
     if not mine:
         text = "📬 No messages yet. Tap 📩 Send message to send your first one."
         if message_id is not None:
