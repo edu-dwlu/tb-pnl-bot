@@ -1102,7 +1102,9 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
             lines.append(f"{fail_msgs} message{'s' if fail_msgs != 1 else ''} could not be queued right now "
                          f"— you can retry later.")
         if stopped:
-            lines.append("⏳ Stopped at the 4-min limit — un-sent messages were dropped.")
+            lines.append("⏹ Stopped — you pressed ⏹ Stop. Un-sent messages were dropped."
+                         if marker.get("stopped_by") == "user" else
+                         "⏳ Stopped at the 4-min limit — un-sent messages were dropped.")
         lines.append("")
         lines.append("✉️ Message left with the sender devices — it sends automatically when one picks it up. "
                      "📬 My messages shows the delivery status.")
@@ -1132,6 +1134,14 @@ def run_qty_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                 log_sends(recs)
             for _ in ok_devs:
                 bump_user_sends(user_id)
+
+
+def timed_pace(speed: str, n_devs: int) -> float:
+    """Effective msgs/min for a timed run: base pace scaled by the live device
+    count — more senders drain their nodes in parallel. Never below the base
+    pace (a small pool must not outrun its devices), capped at TIMED_PACE_CAP."""
+    base = TIMED_PACES.get(speed if speed in TIMED_PACES else "slow", 6.0)
+    return min(TIMED_PACE_CAP, base * max(1.0, n_devs / 3.0))
 
 
 def run_timed_send(chat_id: int, message_id: Optional[int], to: str, text: str,
@@ -1174,6 +1184,7 @@ def run_timed_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     ok_n = 0
     last_edit = 0.0
     last_sent = 0.0
+    last_dev: Dict[str, float] = {}   # per-device last write time (overwrite guard)
     failed_pairs: List[Tuple[Optional[str], str]] = []
     fail_notes: List[str] = []
     ok_devs: List[Dict[str, str]] = []
@@ -1194,9 +1205,9 @@ def run_timed_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                 f"pace: {TIMED_LABELS[TIMED_ORDER[cur]]} (~{left // 60}:{left % 60:02d} left)\n{capped_note}")
         try:
             if message_id is not None:
-                edit(chat_id, message_id, body, None)
+                edit(chat_id, message_id, body, USER_STOP_KB)
             else:
-                send(chat_id, body, None)
+                send(chat_id, body, USER_STOP_KB)
         except Exception:
             pass
 
@@ -1216,7 +1227,7 @@ def run_timed_send(chat_id: int, message_id: Optional[int], to: str, text: str,
             if now >= end:
                 break
             # pace wait — sleep in small slices so cancel/timeout stays responsive
-            interval = 60.0 / TIMED_PACES[TIMED_ORDER[cur]]
+            interval = 60.0 / timed_pace(TIMED_ORDER[cur], len(plan))
             if last_sent:
                 while True:
                     if stop is not None and (stop.is_set() or USER_ACTIVE.get(user_id) is not marker):
@@ -1233,8 +1244,36 @@ def run_timed_send(chat_id: int, message_id: Optional[int], to: str, text: str,
                     break
             if time.time() >= end:
                 break
-            dev = plan[idx % len(plan)]
-            idx += 1
+            # per-device gap guard — never rewrite a device node within
+            # TIMED_DEV_GAP of its last write: the phone app polls its node
+            # and may not have consumed the previous message yet; a rewrite
+            # would silently overwrite it (a loss the read-back verify can't
+            # see). Scans ahead in the rotation for a free device; if the
+            # whole pool was written recently, waits for the earliest one to
+            # free up — pool size then caps the real rate (N dev ≈ N·10/min).
+            dev = None
+            for off in range(len(plan)):
+                cand = plan[(idx + off) % len(plan)]
+                ckey = _dev_key(cand.get("db"), cand["id"])
+                if time.time() - last_dev.get(ckey, 0.0) >= TIMED_DEV_GAP:
+                    dev = cand
+                    idx += off + 1
+                    break
+            if dev is None:
+                dev = plan[idx % len(plan)]
+                ckey = _dev_key(dev.get("db"), dev["id"])
+                idx += 1
+                due = last_dev.get(ckey, 0.0) + TIMED_DEV_GAP
+                while time.time() < due:
+                    if stop is not None and (stop.is_set() or USER_ACTIVE.get(user_id) is not marker):
+                        aborted = True
+                        break
+                    if time.time() >= end:
+                        break
+                    time.sleep(min(max(due - time.time(), 0.0), 0.25))
+                if aborted or time.time() >= end:
+                    break
+            last_dev[_dev_key(dev.get("db"), dev["id"])] = time.time()
             ok, detail = attempt(dev)
             sent += 1
             last_sent = time.time()
@@ -1266,7 +1305,7 @@ def run_timed_send(chat_id: int, message_id: Optional[int], to: str, text: str,
     lines = [f"<b>{head}</b>: {ok_n} message{'s' if ok_n != 1 else ''} queued"
              f" in the {minutes}-min window.",
              f"To: <code>{html.escape(to)}</code> · SIM {sim}",
-             f"🚦 Final pace: {TIMED_LABELS[TIMED_ORDER[cur]]} (~{int(TIMED_PACES[TIMED_ORDER[cur]])}/min)"]
+             f"🚦 Final pace: {TIMED_LABELS[TIMED_ORDER[cur]]} (~{int(timed_pace(TIMED_ORDER[cur], len(plan)))}/min)"]
     if not is_admin(user_id) and user_id is not None:
         used, left = spend_credits(user_id, ok_n)
         lines.insert(2, f"🪙 Credits −{used} · balance: <b>{left}</b> (≈ {left * SENDS_PER_CREDIT} sends)")
@@ -2030,8 +2069,11 @@ TIMED_ORDER = ("slow", "medium", "fast")
 TIMED_LABELS = {"slow": "🐢 Slow", "medium": "⚡ Medium", "fast": "🚀 Fast"}
 TIMED_MAX_MS = 400        # hard safety cap on messages queued in one run
 TIMED_RAMP_OK = 3         # consecutive clean sends before stepping pace up
+TIMED_DEV_GAP = 6.0       # min seconds between writes to one device node (overwrite guard)
+TIMED_PACE_CAP = 60.0     # fastest effective pace (msgs/min) after device scaling
 
 USER_CANCEL_KB = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "ucancel", "style": "danger"}]]}
+USER_STOP_KB = {"inline_keyboard": [[{"text": "⏹ Stop sending", "callback_data": "ustop", "style": "danger"}]]}
 USER_BACK_KB = {"inline_keyboard": [[{"text": "🔙 Menu", "callback_data": "u_back", "style": "primary"}]]}
 
 
@@ -2144,10 +2186,12 @@ def user_help_text() -> str:
         "4. Choose how many messages to send: 10 / 20 / 50 / 100 — or type any number up to 100. "
         "They are spread evenly across all online senders.\n"
         "   ⏱ Timed send: instead of a fixed count, pick a 1–10 minute window and a speed "
-        "(🐢 Slow ~6/min · ⚡ Medium ~15/min · 🚀 Fast ~30/min). Every run starts at 🐢 slow and "
-        "steps up to your speed only while sends confirm clean; any hiccup drops it back to slow. "
-        "Up to 400 messages per run.\n"
+        "(🐢 Slow ~6/min · ⚡ Medium ~15/min · 🚀 Fast ~30/min — faster with more senders online). "
+        "Every run starts at 🐢 slow and steps up to your speed only while sends confirm clean; "
+        "any hiccup drops it back to slow. Up to 400 messages per run.\n"
         "5. Check the summary (number, message, quantity), pick SIM, tap ✅ Send.\n\n"
+        "⏹ While messages are going out, the progress message has a ⏹ Stop sending button — "
+        "tap it to end the run early; you only pay for the messages already queued.\n"
         "📬 My messages (or /my) shows your recent sends and whether the "
         "device picked them up yet.\n"
         "🪙 Sending uses credits: 1 credit = 3 sends. /credits shows your balance.\n"
@@ -2409,17 +2453,18 @@ def user_confirm(chat_id: int, message_id: Optional[int] = None, _online: Option
         if not (1 <= mins <= MAX_TIMED_MIN) or speed not in TIMED_PACES:
             timer_minutes_prompt(chat_id, message_id)
             return
-        est = min(TIMED_MAX_MS, int(TIMED_PACES[speed] * mins))
+        est = min(TIMED_MAX_MS, int(timed_pace(speed, len(online)) * mins))
         needed = credit_tokens(est)
         preview = st["text"][:400] + ("…" if len(st["text"]) > 400 else "")
         bal = get_credits(chat_id)
         text = (
             "<b>⏱ Confirm timed send</b>\n"
             f"To: <code>{html.escape(st['to'])}</code>\n"
-            f"Window: <b>{mins} min</b> · Speed: <b>{TIMED_LABELS[speed]}</b> (~{int(TIMED_PACES[speed])}/min max)\n"
+            f"Window: <b>{mins} min</b> · Speed: <b>{TIMED_LABELS[speed]}</b> (~{int(timed_pace(speed, len(online)))}/min max)\n"
             f"Up to <b>{est}</b> message{'s' if est != 1 else ''} → spread over "
             f"<b>{len(online)}</b> online sender{'s' if len(online) != 1 else ''}\n"
-            "🛡 Starts 🐢 slow, steps up while sends confirm clean.\n\n"
+            "🛡 Starts 🐢 slow, steps up while sends confirm clean. "
+            "More senders online → faster pace.\n\n"
             f"{html.escape(preview)}\n\n"
             f"🪙 Balance: <b>{bal}</b> credits ({bal * SENDS_PER_CREDIT} sends) · may use up to {needed}\n"
             f"Pick a SIM slot, then:"
@@ -2500,6 +2545,16 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
     elif data == "ucancel":
         USTATE.pop(chat_id, None)
         edit(chat_id, message_id, "Draft cancelled.", USER_KB)
+    elif data == "ustop":
+        mk = USER_ACTIVE.get(chat_id)
+        if mk is not None:
+            mk["stopped_by"] = "user"
+            mk["ev"].set()  # the running send thread notices and stops cleanly
+            if USER_ACTIVE.get(chat_id) is mk:
+                USER_ACTIVE.pop(chat_id, None)  # frees the slot; no watchdog timeout msg
+            answer_callback(callback_id, "⏹ Stopping — the summary will follow shortly.")
+        else:
+            answer_callback(callback_id, "Nothing is running right now.")
     elif data.startswith("uqty:"):
         st = USTATE.get(chat_id)
         if not st or "to" not in st or "text" not in st:
@@ -2589,9 +2644,7 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
             edit(chat_id, message_id, f"🛡 <b>Send cancelled:</b> <code>{html.escape(hit)}</code> is protected by the admin.", USER_KB)
             return
         to, txt, sim = st["to"], st["text"], st.get("sim", 1)
-        if mode == "timer":
-            est = min(TIMED_MAX_MS, int(TIMED_PACES[speed] * mins))
-        else:
+        if mode != "timer":
             if "count" not in st:
                 user_qty_prompt(chat_id, message_id)
                 return
@@ -2602,6 +2655,8 @@ def handle_user_callback(chat_id: int, message_id: int, data: str, callback_id: 
             return
         targets = [{"db": x["db"], "id": x["id"]} for x in online]
         capped = f"⚠️ Only {len(targets)} online — spread across all of them."
+        if mode == "timer":
+            est = min(TIMED_MAX_MS, int(timed_pace(speed, len(targets)) * mins))
         # per-user send timeout: one live send per user (timed runs get window + 90s)
         oldm = USER_ACTIVE.get(chat_id)
         if oldm:
